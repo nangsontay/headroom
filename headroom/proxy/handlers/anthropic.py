@@ -1234,6 +1234,56 @@ class AnthropicHandlerMixin:
                     optimized_tokens = tokenizer.count_messages(optimized_messages)
                     tokens_saved = max(0, original_tokens - optimized_tokens)
 
+            # Mechanism B: activity-based read maturation (flag-gated,
+            # default off). Runs after compression so read_lifecycle
+            # markers are respected, and before body assembly so the
+            # held-Read breakpoint relocation lands in the forwarded
+            # request. Session state (matured markers) rides on the
+            # prefix tracker — same affinity and TTL cleanup as the
+            # freeze state. Advisory: must never fail the request.
+            if self.config.read_maturation and not _bypass:
+                try:
+                    from headroom.config import ReadMaturationConfig
+                    from headroom.transforms.read_maturation import (
+                        ReadMaturationManager,
+                        relocate_cache_breakpoint,
+                    )
+
+                    maturation_mgr = prefix_tracker.read_maturation_manager
+                    if maturation_mgr is None:
+                        maturation_mgr = ReadMaturationManager(
+                            ReadMaturationConfig(
+                                enabled=True,
+                                quiesce_turns=self.config.read_maturation_quiesce_turns,
+                                max_hold_turns=self.config.read_maturation_max_hold_turns,
+                                min_size_bytes=self.config.read_maturation_min_size_bytes,
+                            ),
+                            compression_store=get_compression_store(),
+                        )
+                        prefix_tracker.read_maturation_manager = maturation_mgr
+                    maturation = maturation_mgr.apply(
+                        optimized_messages,
+                        frozen_message_count=frozen_message_count,
+                    )
+                    if maturation.replacements_applied or maturation.holding_msg_indices:
+                        optimized_messages = relocate_cache_breakpoint(
+                            maturation.messages,
+                            maturation.holding_msg_indices,
+                        )
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        tokens_saved = max(0, original_tokens - optimized_tokens)
+                        if maturation.newly_matured:
+                            transforms_applied.append(f"read_maturation:{maturation.newly_matured}")
+                        logger.debug(
+                            f"[{request_id}] read_maturation: "
+                            f"holding={len(maturation.holding_msg_indices)} "
+                            f"matured={maturation.newly_matured} "
+                            f"replayed={maturation.replacements_applied} "
+                            f"bytes_saved={maturation.bytes_saved}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[{request_id}] read maturation failed: {e}")
+
             # Hook: post_compress — let hooks observe compression results
             if self.config.hooks and tokens_saved > 0:
                 from headroom.hooks import CompressEvent
@@ -1671,8 +1721,11 @@ class AnthropicHandlerMixin:
             # Update body
             body["messages"] = optimized_messages
             if tools or _original_tools is not None:
-                tools = self._sort_tools_deterministically(tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(tools)
+                if sorted_tools != tools:
+                    tools = sorted_tools
+                if tools != _original_tools:
+                    body["tools"] = tools
 
             presend_event = self.pipeline_extensions.emit(
                 PipelineStage.PRE_SEND,
@@ -1690,8 +1743,14 @@ class AnthropicHandlerMixin:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
             if presend_event.tools is not None:
-                tools = self._sort_tools_deterministically(presend_event.tools)
-                body["tools"] = tools
+                sorted_tools = self._sort_tools_deterministically(presend_event.tools)
+                if sorted_tools != presend_event.tools:
+                    tools = sorted_tools
+                else:
+                    tools = presend_event.tools
+                if tools or body.get("tools") is not None:
+                    if tools != body.get("tools"):
+                        body["tools"] = tools
             if presend_event.headers is not None:
                 headers = presend_event.headers
             if presend_event.messages is not previous_presend_messages:
@@ -2646,9 +2705,11 @@ class AnthropicHandlerMixin:
             custom_id = batch_req.get("custom_id", "")
             params = batch_req.get("params", {})
             canonical_params = dict(params)
-            canonical_tools = canonical_params.get("tools")
-            if canonical_tools is not None:
-                canonical_params["tools"] = self._sort_tools_deterministically(canonical_tools)
+            original_tools = canonical_params.get("tools")
+            if original_tools is not None:
+                sorted_tools = self._sort_tools_deterministically(original_tools)
+                if sorted_tools != original_tools:
+                    canonical_params["tools"] = sorted_tools
             messages = params.get("messages", [])
             original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
@@ -2684,6 +2745,7 @@ class AnthropicHandlerMixin:
                         context=extract_user_query(messages),
                         frozen_message_count=frozen_message_count,
                         request_id=request_id,
+                        **proxy_pipeline_kwargs(self.config),
                     )
 
                     optimized_messages = result.messages
@@ -2725,7 +2787,12 @@ class AnthropicHandlerMixin:
                 # Create compressed batch request
                 compressed_params = {**params, "messages": optimized_messages}
                 if tools is not None:
-                    compressed_params["tools"] = self._sort_tools_deterministically(tools)
+                    sorted_tools = self._sort_tools_deterministically(tools)
+                    if sorted_tools != tools:
+                        tools = sorted_tools
+                    if tools or original_tools is not None:
+                        if tools != original_tools:
+                            compressed_params["tools"] = tools
                 compressed_requests.append(
                     {
                         "custom_id": custom_id,
