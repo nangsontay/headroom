@@ -301,6 +301,27 @@ def _format_unbindable_port_error(port: int, error: OSError, agent_type: str) ->
     )
 
 
+def _load_headroom_dotenv() -> None:
+    """Load .env files before proxy start and env var resolution.
+
+    Priority (highest to lowest): shell env > CWD/.env > ~/.headroom/.env.
+    Uses override=False so existing shell vars always win.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    global_env = Path.home() / ".headroom" / ".env"
+    cwd_env = Path.cwd() / ".env"
+
+    # Load global first so CWD can override it
+    if global_env.is_file():
+        load_dotenv(global_env, override=False)
+    if cwd_env.is_file():
+        load_dotenv(cwd_env, override=False)
+
+
 def _get_log_path() -> Path:
     """Get path for proxy log file."""
     from headroom import paths as _paths
@@ -2984,6 +3005,7 @@ def claude(
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --no-serena        # Skip Serena MCP registration
     """
+    _load_headroom_dotenv()
     if prepare_only:
         if not no_rtk:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
@@ -3619,6 +3641,7 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    _load_headroom_dotenv()
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
     # byte-for-byte. The snapshot is a no-op if the backup already exists
@@ -3817,6 +3840,7 @@ def aider(
         headroom wrap aider --no-context-tool            # Skip CLI context-tool setup
         headroom wrap aider --backend litellm-vertex --region us-central1
     """
+    _load_headroom_dotenv()
     # Setup CLI context tool for aider.
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
