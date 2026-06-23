@@ -41,7 +41,7 @@ _OFF_VALUES = frozenset(("off", "false", "0", "no", "disable", "disabled"))
 _TRUE_VALUES = frozenset(("on", "true", "1", "yes", "enable", "enabled"))
 
 
-def _env_off(name: str, default: str = "on") -> bool:
+def _env_off(name: str, default: str = "off") -> bool:
     """Return True when env var ``name`` is set to a falsey/off value."""
     return os.environ.get(name, default).strip().lower() in _OFF_VALUES
 

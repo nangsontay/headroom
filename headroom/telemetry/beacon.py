@@ -76,7 +76,7 @@ def is_telemetry_enabled() -> bool:
     explicit on-value (on/true/1/yes/enable/enabled). Anything else — including
     unset, empty, or an unrecognized value — leaves it disabled.
     """
-    val = os.environ.get("HEADROOM_TELEMETRY", "").lower().strip()
+    val = os.environ.get("HEADROOM_TELEMETRY", "off").lower().strip()
     return val in _ON_VALUES
 
 

@@ -234,7 +234,7 @@ def _mirror_url(url: str) -> str:
 
 
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
-    if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
+    if os.environ.get("HEADROOM_BINARIES_OFFLINE", "1"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
     if not _has_writable_existing_parent(dest.parent):
         raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
