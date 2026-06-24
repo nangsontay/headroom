@@ -383,7 +383,7 @@ def _onnx_filename_candidates() -> tuple[str, ...]:
 
 def _create_onnx_session(
     model_id: str, providers: list[Any], *, allow_download: bool = True
-) -> Any:
+) -> tuple[Any, bool]:
     """Resolve and load the model's ONNX artifact, trying candidates in order.
 
     A candidate is skipped on download miss (file not in the repo) or on
@@ -395,13 +395,16 @@ def _create_onnx_session(
     cache only; if none is cached, :class:`KompressModelNotCached` is raised
     instead of hitting the network. ``onnxruntime`` is imported only after a
     candidate resolves, so a cache-only miss never requires it.
+
+    Returns ``(session, from_cache)`` where ``from_cache`` is ``True`` when the
+    artifact was served from the local HF cache without a network request.
     """
     last_err: Exception | None = None
     cache_miss = False
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = hf_hub_download_local_first(
+            onnx_path, from_cache = hf_hub_download_local_first(
                 model_id, filename, allow_network=allow_download
             )
         except Exception as exc:
@@ -414,10 +417,13 @@ def _create_onnx_session(
 
             ort = onnxruntime
         try:
-            return ort.InferenceSession(
-                onnx_path,
-                _onnx_session_options(ort),
-                providers=providers,
+            return (
+                ort.InferenceSession(
+                    onnx_path,
+                    _onnx_session_options(ort),
+                    providers=providers,
+                ),
+                from_cache,
             )
         except Exception as exc:
             last_err = exc
@@ -450,7 +456,7 @@ def _load_kompress_onnx(
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        logger.info("Downloading Kompress ONNX model from %s ...", model_id)
+        logger.info("Loading Kompress ONNX model from %s ...", model_id)
 
         backend = "onnx_coreml" if use_coreml else "onnx"
         providers: list[Any]
@@ -479,7 +485,9 @@ def _load_kompress_onnx(
         else:
             providers = ["CPUExecutionProvider"]
 
-        session = _create_onnx_session(model_id, providers, allow_download=allow_download)
+        session, from_cache = _create_onnx_session(
+            model_id, providers, allow_download=allow_download
+        )
         model = _OnnxModel(session)
 
         from transformers import AutoTokenizer
@@ -487,7 +495,12 @@ def _load_kompress_onnx(
         tokenizer = _load_modernbert_tokenizer(AutoTokenizer, allow_download=allow_download)
 
         _kompress_cache[model_id] = (model, tokenizer, backend)
-        logger.info("Kompress ONNX loaded: %s backend=%s", model_id, backend)
+        logger.info(
+            "Kompress ONNX loaded: %s backend=%s source=%s",
+            model_id,
+            backend,
+            "cache" if from_cache else "downloaded",
+        )
         return model, tokenizer, backend
 
 
@@ -518,10 +531,10 @@ def _load_kompress_pytorch(
         if model_id in _kompress_cache:
             return _kompress_cache[model_id]
 
-        logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
+        logger.info("Loading Kompress PyTorch model from %s ...", model_id)
 
         try:
-            weights_path = hf_hub_download_local_first(
+            weights_path, from_cache = hf_hub_download_local_first(
                 model_id, "model.safetensors", allow_network=allow_download
             )
         except _NOT_CACHED_ERRORS as exc:
@@ -552,7 +565,12 @@ def _load_kompress_pytorch(
         _validate_pytorch_device(model, tokenizer, device)
 
         _kompress_cache[model_id] = (model, tokenizer, "pytorch")
-        logger.info("Kompress PyTorch loaded on %s (%s)", device, model_id)
+        logger.info(
+            "Kompress PyTorch loaded on %s (%s) source=%s",
+            device,
+            model_id,
+            "cache" if from_cache else "downloaded",
+        )
         return model, tokenizer, "pytorch"
 
 

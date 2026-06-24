@@ -7,7 +7,9 @@ import sys
 from typing import Any
 
 
-def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: bool = True) -> str:
+def hf_hub_download_local_first(
+    repo_id: str, filename: str, *, allow_network: bool = True
+) -> tuple[str, bool]:
     """Download a file from HuggingFace Hub, preferring the local cache.
 
     Tries ``local_files_only=True`` first to avoid a network HEAD request when
@@ -23,7 +25,9 @@ def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: b
             download stack, kill) the process before it binds its port.
 
     Returns:
-        Absolute path to the local cached file.
+        ``(path, from_cache)`` — absolute path to the local file, and whether
+        it was served from the local cache (``True``) or fetched over the
+        network (``False``).
 
     Raises:
         Any exception raised by ``hf_hub_download`` on a genuine download failure,
@@ -34,11 +38,11 @@ def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: b
     from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
     try:
-        return str(hf_hub_download(repo_id, filename, local_files_only=True))
+        return str(hf_hub_download(repo_id, filename, local_files_only=True)), True
     except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
         if not allow_network:
             raise
-        return str(hf_hub_download(repo_id, filename))
+        return str(hf_hub_download(repo_id, filename)), False
 
 
 def create_cpu_session_options(

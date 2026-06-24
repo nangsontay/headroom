@@ -341,8 +341,8 @@ class OnnxLocalEmbedder:
         logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
 
         # Prefer local cache to avoid a redundant network HEAD on warm starts.
-        model_path = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
-        tok_path = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
+        model_path, _ = hf_hub_download_local_first(self.ONNX_REPO, "model.onnx")
+        tok_path, _ = hf_hub_download_local_first(self.ONNX_REPO, "tokenizer.json")
 
         # Keep a small thread pool for Docker compatibility and disable ORT's
         # CPU memory arena/pattern caches so long-running proxy workers do not

@@ -41,6 +41,25 @@ def test_local_first_no_network_when_disallowed(monkeypatch):
     assert calls == [True]
 
 
+def test_local_first_returns_from_cache_true_on_hit(monkeypatch):
+    """Cache hit must return from_cache=True without touching the network."""
+    import huggingface_hub
+
+    calls: list[bool] = []
+
+    def fake_download(repo_id, filename, **kwargs):
+        local_only = kwargs.get("local_files_only", False)
+        calls.append(local_only)
+        return "/cache/local"
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    path, from_cache = onnx_runtime.hf_hub_download_local_first("org/model", "f.onnx")
+    assert path == "/cache/local"
+    assert from_cache is True
+    assert calls == [True]  # only the local-only lookup ran
+
+
 def test_local_first_falls_back_to_network_by_default(monkeypatch):
     """allow_network=True (default) keeps the historic cold-start behavior."""
     import huggingface_hub
@@ -57,8 +76,9 @@ def test_local_first_falls_back_to_network_by_default(monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
 
-    path = onnx_runtime.hf_hub_download_local_first("org/model", "f.onnx")
+    path, from_cache = onnx_runtime.hf_hub_download_local_first("org/model", "f.onnx")
     assert path == "/cache/networked"
+    assert from_cache is False  # network download, not cache
     assert calls == [True, False]  # local-only miss, then network download
 
 
