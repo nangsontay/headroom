@@ -616,7 +616,7 @@ class CostTracker:
         """
         litellm = _get_litellm_module()
         if litellm is None:
-            logger.warning("LiteLLM not available - cannot calculate costs")
+            logger.debug("LiteLLM not available - cannot calculate costs")
             return None
 
         try:

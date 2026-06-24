@@ -1286,16 +1286,21 @@ class HeadroomProxy(
                     self.warmup.merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
-        if eager_status.get("kompress") == "enabled":
+        kompress_eager = eager_status.get("kompress", "")
+        if kompress_eager == "enabled":
             self._kompress_status = "enabled"
+        elif kompress_eager == "deferred":
+            self._kompress_status = "deferred"
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
 
         # Log component status
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
+        elif self._kompress_status == "deferred":
+            logger.info("Kompress: AVAILABLE (model not cached; will download on first use)")
         elif self.config.optimize:
-            logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
+            logger.info("Kompress: not installed (pip install headroom-ai[proxy] for ML compression)")
 
         if self._code_aware_status == "enabled":
             logger.info("Code-Aware: ENABLED (AST-based compression)")

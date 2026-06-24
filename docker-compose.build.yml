@@ -1,0 +1,26 @@
+# docker-compose.build.yml — local wheel builder for headroom-ai
+#
+# Builds the headroom-ai Python wheel (requires Rust toolchain + maturin)
+# and outputs it to ./dist/ so it can be installed with:
+#   pip install dist/headroom_ai-*.whl
+#
+# Usage:
+#   docker compose -f docker-compose.build.yml build
+#   docker compose -f docker-compose.build.yml run --rm wheel-builder
+
+services:
+  wheel-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+    volumes:
+      # Output: wheel files land here after the build
+      - ./dist:/dist
+      # Persist Cargo registry cache across runs to skip re-downloading crates
+      - cargo_registry:/usr/local/cargo/registry
+      # Persist incremental Rust build artifacts to speed up rebuilds
+      - build_cache:/src/target
+
+volumes:
+  cargo_registry:
+  build_cache:

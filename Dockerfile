@@ -50,6 +50,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/build/target \
     uv pip install --system ".[${HEADROOM_EXTRAS}]"
+RUN python -m pip install --no-cache-dir maturin
 
 # Build-stage smoke check: verify the extension loads end-to-end inside
 # the build image before we copy site-packages into the runtime image.
