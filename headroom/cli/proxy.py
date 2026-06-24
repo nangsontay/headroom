@@ -310,6 +310,17 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--anthropic-buffered-request-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+    help=(
+        "Buffered Anthropic read timeout in seconds for non-streaming "
+        "message and batch paths (default: 600). "
+        "Env: HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
     "--anthropic-pre-upstream-concurrency",
     type=int,
     default=None,
@@ -765,6 +776,7 @@ def proxy(
     retry_max_attempts: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
@@ -989,6 +1001,11 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        anthropic_buffered_request_timeout_seconds=(
+            anthropic_buffered_request_timeout_seconds
+            if anthropic_buffered_request_timeout_seconds is not None
+            else 600
+        ),
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
         keepalive_expiry=keepalive_expiry,
@@ -1273,9 +1290,13 @@ Press Ctrl+C to stop.
 
         import asyncio as _asyncio
 
-        from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
-
         async def _start_embed_watchdog() -> Any:
+            # Import lazily inside the guarded coroutine. The sidecar module is
+            # optional and may be absent; keeping the import here lets the
+            # try/except below fall back to the per-worker embedder instead of
+            # crashing the proxy at startup with ModuleNotFoundError.
+            from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
+
             wd = EmbeddingServerWatchdog(socket_path=_embed_socket)
             await wd.start()
             ok = await wd.wait_until_healthy(timeout=30.0)
