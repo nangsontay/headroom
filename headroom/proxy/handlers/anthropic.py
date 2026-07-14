@@ -31,6 +31,7 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import extract_tags
+from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.outcome import RequestOutcome
@@ -1161,19 +1162,18 @@ class AnthropicHandlerMixin:
                 try:
                     compressor = _get_image_compressor()
                     if compressor and compressor.has_images(messages):
-                        # Offload CPU-bound image compression onto the bounded
-                        # executor (same as text compression); inline blocked the loop.
-                        messages = await self._run_compression_in_executor(
-                            lambda: compressor.compress(messages, provider="anthropic"),
+                        messages, image_result = await run_image_compression_isolated(
+                            messages,
+                            provider="anthropic",
                             timeout=COMPRESSION_TIMEOUT_SECONDS,
                         )
-                        body_mutation_tracker.mark_mutated("image_compression")
-                        if compressor.last_result:
+                        if image_result is not None:
+                            body_mutation_tracker.mark_mutated("image_compression")
                             logger.info(
-                                f"Image compression: {compressor.last_result.technique.value} "
-                                f"({compressor.last_result.savings_percent:.0f}% saved, "
-                                f"{compressor.last_result.original_tokens} -> "
-                                f"{compressor.last_result.compressed_tokens} tokens)"
+                                f"Image compression: {image_result['technique']} "
+                                f"({image_result['savings_percent']:.0f}% saved, "
+                                f"{image_result['original_tokens']} -> "
+                                f"{image_result['compressed_tokens']} tokens)"
                             )
                 except Exception as e:
                     # Image compression is best-effort — fail open on timeout/error and
