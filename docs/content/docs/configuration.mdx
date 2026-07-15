@@ -317,7 +317,7 @@ For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide varia
 
 ### Session Beta Header Tracking
 
-When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt[:500])[:16]` — stable across turns of the same conversation.
+When running as a proxy, Headroom maintains a per-session union of `anthropic-beta` (and `OpenAI-Beta`) tokens via `SessionBetaTracker`. The session key is derived from the `x-headroom-session-id` header if present, otherwise from `md5(model + system_prompt + conversation_discriminator)[:16]`, where the discriminator is a client-supplied hint (Anthropic `metadata.user_id` / OpenAI `user`) or, failing that, the first user message's text. This keeps the key stable across turns of one conversation while staying distinct across concurrent conversations that share a model and system prompt.
 
 **Why:** clients such as Claude Code and Codex CLI may drop a beta token between consecutive turns. Because `anthropic-beta` is part of the request bytes that determine the upstream prefix-cache key, a dropped token would bust the cache mid-conversation. The tracker re-injects any token seen earlier in the session so the cache key stays stable.
 

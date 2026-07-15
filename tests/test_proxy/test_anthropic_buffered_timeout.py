@@ -79,7 +79,7 @@ def _make_config() -> ProxyConfig:
 
 def _install_prefix_tracker(proxy) -> None:
     tracker = _FakePrefixTracker()
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **_kwargs: "s1"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
 
 

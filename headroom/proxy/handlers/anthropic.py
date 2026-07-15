@@ -30,7 +30,7 @@ from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import extract_tags, injection_target_already_forwarded
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -64,6 +64,49 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             block.pop("index", None)
             # tool_result blocks nest their own content list of blocks.
             _strip_index_from_content_blocks(block.get("content"))
+
+
+def _append_ccr_instructions_to_system(body: dict[str, Any]) -> bool:
+    """Append stable CCR retrieval instructions to ``body["system"]`` in place.
+
+    Anthropic carries the system prompt as a top-level ``body["system"]``
+    field (bare string, or a list of content blocks) rather than a
+    ``role:"system"`` message — inserting one of those into ``messages``
+    (the pre-fix behavior) makes the Messages API reject the whole request
+    with a 400. This routes the same instructions to the correct field
+    instead.
+
+    Idempotent (a no-op if the instructions are already present) and, for a
+    list-shaped system prompt, appends a NEW block rather than touching
+    existing ones, so any existing ``cache_control`` breakpoints are left
+    undisturbed.
+
+    Returns True iff ``body["system"]`` was actually mutated.
+    """
+    from headroom.ccr.tool_injection import create_stable_system_instructions
+
+    sentinel = "Compressed Context Available"
+    instructions = create_stable_system_instructions()
+    system = body.get("system")
+
+    if system is None:
+        body["system"] = instructions.strip()
+        return True
+
+    if isinstance(system, str):
+        if sentinel in system:
+            return False
+        body["system"] = system + instructions
+        return True
+
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and sentinel in str(block.get("text", "")):
+                return False
+        system.append({"type": "text", "text": instructions.strip()})
+        return True
+
+    return False
 
 
 class AnthropicHandlerMixin:
@@ -1076,7 +1119,10 @@ class AnthropicHandlerMixin:
                 else messages
             )
             session_id = self.session_tracker_store.compute_session_id(
-                request, model, session_messages
+                request,
+                model,
+                session_messages,
+                conversation_hint=(body.get("metadata") or {}).get("user_id"),
             )
             prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
             frozen_message_count = prefix_tracker.get_frozen_message_count()
@@ -1811,12 +1857,6 @@ class AnthropicHandlerMixin:
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
-                if inject_system_instructions and frozen_message_count > 0:
-                    logger.info(
-                        f"[{request_id}] CCR: skipping system instruction injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
-                    )
-                    inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
                 if configured_inject_tool and frozen_message_count > 0:
                     logger.info(
@@ -1828,11 +1868,21 @@ class AnthropicHandlerMixin:
                 injector = CCRToolInjector(
                     provider="anthropic",
                     inject_tool=False,  # routed through sticky helper below
-                    inject_system_instructions=inject_system_instructions,
+                    # Anthropic routes system instructions to body["system"]
+                    # below, not into messages — the injector's own
+                    # messages-based path is never used for this provider.
+                    inject_system_instructions=False,
                 )
                 injector.scan_for_markers(optimized_messages)
                 if inject_system_instructions and injector.has_compressed_content:
-                    optimized_messages = injector.inject_into_system_message(optimized_messages)
+                    # No frozen_message_count gate: body["system"] is a
+                    # top-level field, not part of the messages-array freeze,
+                    # and the instructions are static (hash-free) so the
+                    # bytes stay identical every turn this fires — the cache-
+                    # safety concern the old gate guarded against doesn't
+                    # apply here (#A2).
+                    if _append_ccr_instructions_to_system(body):
+                        body_mutation_tracker.mark_mutated("ccr_system_instructions")
 
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
@@ -1927,6 +1977,7 @@ class AnthropicHandlerMixin:
                                     workspace_key=ccr_workspace_key,
                                     query_context=entry.get("query_context", ""),
                                     sample_content=entry.get("compressed_content", "")[:500],
+                                    session_id=session_id,
                                 )
                     elif self.ccr_context_tracker and not ccr_workspace_key:
                         logger.info(
@@ -1961,7 +2012,23 @@ class AnthropicHandlerMixin:
                         user_query,
                         self._turn_counter,
                         workspace_key=ccr_workspace_key,
+                        session_id=session_id,
                     )
+                    expansion_dedup_tracker = None
+                    if recommendations and session_id:
+                        from headroom.proxy.helpers import (
+                            get_session_expansion_dedup_tracker,
+                        )
+
+                        expansion_dedup_tracker = get_session_expansion_dedup_tracker()
+                        new_hash_keys = set(
+                            expansion_dedup_tracker.filter_new(
+                                session_id, [r.hash_key for r in recommendations]
+                            )
+                        )
+                        recommendations = [
+                            r for r in recommendations if r.hash_key in new_hash_keys
+                        ]
                     if recommendations:
                         expansions = self.ccr_context_tracker.execute_expansions(recommendations)
                         if expansions:
@@ -1981,6 +2048,16 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] CCR: skipping proactive expansion append "
                                     "in cache mode to preserve next-turn prefix stability"
                                 )
+                            elif injection_target_already_forwarded(
+                                optimized_messages,
+                                prefix_tracker=prefix_tracker,
+                                current_original_messages=original_client_messages,
+                            ):
+                                logger.info(
+                                    f"[{request_id}] CCR: skipping proactive expansion append — "
+                                    "tail position already forwarded last turn "
+                                    "(would double-inject, #2186)"
+                                )
                             else:
                                 optimized_messages = (
                                     self._append_context_to_latest_non_frozen_user_turn(
@@ -1989,6 +2066,10 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=frozen_message_count,
                                     )
                                 )
+                                if expansion_dedup_tracker and session_id:
+                                    expansion_dedup_tracker.record_injected(
+                                        session_id, [e["hash"] for e in expansions]
+                                    )
 
             # Traffic Learner: Extract patterns from inbound tool results
             if self.traffic_learner:
@@ -2074,6 +2155,21 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     session_id=session_id,
                                     decision="skipped_cache_mode",
+                                    bytes_injected=0,
+                                    query=user_query,
+                                )
+                            elif injection_target_already_forwarded(
+                                optimized_messages,
+                                prefix_tracker=prefix_tracker,
+                                current_original_messages=original_client_messages,
+                            ):
+                                # Tail position already forwarded last turn; the
+                                # overlay replayed it byte-identical, so appending
+                                # here would double-inject (#2186).
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=session_id,
+                                    decision="skipped_already_forwarded",
                                     bytes_injected=0,
                                     query=user_query,
                                 )
@@ -3592,7 +3688,10 @@ class AnthropicHandlerMixin:
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
                     result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
+                        lambda messages=messages,
+                        model=model,
+                        context_limit=context_limit,
+                        frozen_message_count=frozen_message_count: (
                             self.anthropic_pipeline.apply(
                                 messages=messages,
                                 model=model,

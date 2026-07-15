@@ -351,6 +351,33 @@ def overlay_cached_prefix(
     return list(prev_fwd[:k]) + list(optimized_messages[k:])
 
 
+def is_append_only_extension(
+    current_original_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+) -> bool:
+    """Return True iff ``previous_original_messages`` is a full canonical
+    prefix of ``current_original_messages``.
+
+    This is the same append-only condition ``overlay_cached_prefix`` requires
+    before it will replay ANY previously-forwarded content — a position is
+    only guaranteed to hold last turn's cached bytes when this holds for the
+    ENTIRE previous message list, not just a leading run of it. Used by
+    handler-level injection guards to detect "this exact tail position was
+    already forwarded last turn" without duplicating the canonicalization
+    logic.
+    """
+    if not previous_original_messages:
+        return False
+    n = len(previous_original_messages)
+    if len(current_original_messages) < n:
+        return False
+    return all(
+        _canonicalize_for_prefix_compare(current_original_messages[i])
+        == _canonicalize_for_prefix_compare(previous_original_messages[i])
+        for i in range(n)
+    )
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -482,6 +509,14 @@ class PrefixCacheTracker:
         """
         self._last_activity = time.time()
         self._turn_number += 1
+        if original_messages is None:
+            logger.warning(
+                "PrefixCacheTracker[%s]: update_from_response called without "
+                "original_messages — falling back to forwarded messages as "
+                "originals, which busts the overlay's append-only cache-safety "
+                "check on the next turn.",
+                self.provider,
+            )
         self._last_original_messages = copy.deepcopy(original_messages or messages)
         self._last_forwarded_messages = copy.deepcopy(messages)
 
@@ -764,6 +799,30 @@ class PrefixCacheTracker:
         return counts
 
 
+def _first_user_message_text(messages: list[dict[str, Any]]) -> str:
+    """Extract the first user message's text, capped for use as a hash input.
+
+    Stable within one append-only conversation (the client always resends the
+    first message unchanged) but differs across conversations in practice, so
+    it serves as a conversation discriminator when no explicit hint is given.
+    """
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content[:500]
+        if isinstance(content, list):
+            parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return "".join(parts)[:500]
+        return ""
+    return ""
+
+
 class SessionTrackerStore:
     """Manages PrefixCacheTracker instances across sessions.
 
@@ -800,12 +859,19 @@ class SessionTrackerStore:
         request: Any,
         model: str,
         messages: list[dict[str, Any]],
+        *,
+        conversation_hint: str | None = None,
     ) -> str:
         """Compute a session ID from the request.
 
         Priority:
         1. x-headroom-session-id header (explicit)
-        2. Hash of (model + system prompt) — stable per conversation
+        2. Hash of (model + system prompt + conversation discriminator)
+
+        The discriminator is ``conversation_hint`` when the caller supplies one
+        (Anthropic ``metadata.user_id`` / OpenAI ``user``), else the first user
+        message's text. It keeps concurrent or successive conversations that
+        share a model+system prompt from colliding onto one tracker.
 
         The system prompt is harvested from ``role:"system"`` entries in
         ``messages``. Anthropic carries the system prompt as a top-level
@@ -834,7 +900,17 @@ class SessionTrackerStore:
                             system_parts.append(block.get("text", ""))
 
         system_content = json.dumps(system_parts, ensure_ascii=False, separators=(",", ":"))
-        key = f"{model}:{system_content}"
+        # Conversation discriminator: two conversations sharing model+system
+        # (concurrent tabs, a new session started after ending one) must NOT
+        # collapse onto the same tracker/CCR-sticky state. Prefer a
+        # client-supplied hint (Anthropic metadata.user_id / OpenAI user);
+        # fall back to the first user message's text, which is stable across
+        # append-only turns of ONE conversation but differs across
+        # conversations in practice. Hash only — never log raw content.
+        discriminator = str(conversation_hint)[:200] if conversation_hint else ""
+        if not discriminator:
+            discriminator = _first_user_message_text(messages)
+        key = f"{model}:{system_content}:{discriminator}"
         return hashlib.md5(key.encode()).hexdigest()[:16]  # nosec B324
 
     def _maybe_cleanup(self) -> None:

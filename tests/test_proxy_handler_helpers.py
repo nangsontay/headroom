@@ -9,8 +9,12 @@ from unittest.mock import patch
 
 import httpx
 from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
 
-from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.handlers.anthropic import (
+    AnthropicHandlerMixin,
+    _append_ccr_instructions_to_system,
+)
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _decode_openai_bearer_payload,
@@ -18,7 +22,7 @@ from headroom.proxy.handlers.openai import (
     _prefers_http1_passthrough,
 )
 from headroom.proxy.helpers import _headroom_bypass_enabled
-from headroom.proxy.server import HeadroomProxy
+from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
 def _jwt(payload: object) -> str:
@@ -1069,3 +1073,158 @@ def test_handle_streaming_passthrough_client_disconnect():
         )
     )
     assert response.status_code == 204
+
+
+def _make_proxy_client(**config_overrides) -> TestClient:
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        **config_overrides,
+    )
+    return TestClient(create_app(config))
+
+
+def test_anthropic_handler_passes_metadata_user_id_as_conversation_hint() -> None:
+    """#1808: metadata.user_id must reach compute_session_id so two Claude Code
+    tabs on the same model+system don't collapse onto one tracker."""
+    captured: dict = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        real_compute = proxy.session_tracker_store.compute_session_id
+
+        def _spy(request, model, messages, **kwargs):
+            captured["conversation_hint"] = kwargs.get("conversation_hint")
+            return real_compute(request, model, messages, **kwargs)
+
+        proxy.session_tracker_store.compute_session_id = _spy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 3},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "metadata": {"user_id": "conversation-xyz"},
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert captured["conversation_hint"] == "conversation-xyz"
+
+
+def test_openai_handler_passes_user_field_as_conversation_hint() -> None:
+    """#1808: OpenAI's `user` field must reach compute_session_id."""
+    captured: dict = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        real_compute = proxy.session_tracker_store.compute_session_id
+
+        def _spy(request, model, messages, **kwargs):
+            captured["conversation_hint"] = kwargs.get("conversation_hint")
+            return real_compute(request, model, messages, **kwargs)
+
+        proxy.session_tracker_store.compute_session_id = _spy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer [REDACTED:Bearer token]"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hi"}],
+                "user": "conversation-abc",
+                "stream": False,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert captured["conversation_hint"] == "conversation-abc"
+
+
+def test_append_ccr_instructions_to_system_when_absent() -> None:
+    """#A2: with no ``system`` field, instructions become the whole string."""
+    body: dict = {}
+    mutated = _append_ccr_instructions_to_system(body)
+    assert mutated is True
+    assert "Compressed Context Available" in body["system"]
+
+
+def test_append_ccr_instructions_to_system_appends_to_string() -> None:
+    body = {"system": "You are a helpful assistant."}
+    mutated = _append_ccr_instructions_to_system(body)
+    assert mutated is True
+    assert body["system"].startswith("You are a helpful assistant.")
+    assert "Compressed Context Available" in body["system"]
+
+
+def test_append_ccr_instructions_to_system_string_is_idempotent() -> None:
+    """Calling twice must not duplicate the block (keeps the segment stable)."""
+    body = {"system": "You are a helpful assistant."}
+    _append_ccr_instructions_to_system(body)
+    first = body["system"]
+    mutated_again = _append_ccr_instructions_to_system(body)
+    assert mutated_again is False
+    assert body["system"] == first
+    assert body["system"].count("Compressed Context Available") == 1
+
+
+def test_append_ccr_instructions_to_system_appends_new_block_for_list() -> None:
+    """List-shaped system prompts get a NEW block; existing cache_control
+    breakpoints on prior blocks must be left untouched (#A2)."""
+    original_block = {
+        "type": "text",
+        "text": "You are a helpful assistant.",
+        "cache_control": {"type": "ephemeral"},
+    }
+    body = {"system": [dict(original_block)]}
+    mutated = _append_ccr_instructions_to_system(body)
+    assert mutated is True
+    assert body["system"][0] == original_block
+    assert len(body["system"]) == 2
+    assert "Compressed Context Available" in body["system"][1]["text"]
+    assert "cache_control" not in body["system"][1]
+
+
+def test_append_ccr_instructions_to_system_list_is_idempotent() -> None:
+    body = {"system": [{"type": "text", "text": "You are a helpful assistant."}]}
+    _append_ccr_instructions_to_system(body)
+    mutated_again = _append_ccr_instructions_to_system(body)
+    assert mutated_again is False
+    assert len(body["system"]) == 2

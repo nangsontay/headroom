@@ -76,7 +76,7 @@ def _install_memory_handler(proxy: object) -> None:
 def _install_session_tracker(proxy: object, frozen_count: int) -> None:
     fake_tracker = _FakePrefixTracker(frozen_count=frozen_count)
     proxy.session_tracker_store.compute_session_id = (  # type: ignore[attr-defined]
-        lambda request, model, messages: "stable-session"
+        lambda request, model, messages, **_kwargs: "stable-session"
     )
     proxy.session_tracker_store.get_or_create = (  # type: ignore[attr-defined]
         lambda session_id, provider: fake_tracker
