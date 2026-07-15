@@ -1795,6 +1795,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        original_messages: list[dict] | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
@@ -1936,6 +1937,7 @@ class StreamingMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=tracker_messages,
+                        original_messages=original_messages,
                     )
 
                 # CCR Feedback: record headroom_retrieve tool calls so

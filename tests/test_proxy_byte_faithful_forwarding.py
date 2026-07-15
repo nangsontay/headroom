@@ -357,7 +357,7 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
     # Pin a stable session tracker so the prefix walker doesn't re-read
     # turn 0 on every run.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **_kwargs: "s1"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
     return TestClient(app), transport
@@ -985,7 +985,7 @@ def test_streaming_forwarder_byte_faithful() -> None:
 
     # Pin session tracker so the cache-stable delta path is a no-op.
     fake_tracker = _FakePrefixTracker(frozen_count=0)
-    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s_stream"
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **_kwargs: "s_stream"
     proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
     transport = _StreamingCapturingTransport()
@@ -1080,7 +1080,7 @@ def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
         old_anthropic_url = type(proxy).ANTHROPIC_API_URL
         type(proxy).ANTHROPIC_API_URL = "https://custom.example"
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages, **_kwargs: (
             "custom-stream-beta-1"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
