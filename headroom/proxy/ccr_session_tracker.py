@@ -85,3 +85,56 @@ class SessionCcrTracker:
 
         with self._lock:
             self._sessions.clear()
+
+
+class SessionExpansionDedupTracker:
+    """Bounded LRU tracker for per-session CCR proactive-expansion dedup.
+
+    Prevents the same compressed-content hash from being proactively
+    re-injected more than once per session (#2186): a same-messages
+    re-request or a continued conversation must not receive duplicate
+    expansion blocks for content the agent already saw this session.
+    Dedup is per-session, not global — a different conversation may
+    legitimately need the same expansion.
+    """
+
+    def __init__(self, max_sessions: int) -> None:
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be > 0")
+        self._max_sessions = max_sessions
+        self._lock = threading.RLock()
+        self._sessions: OrderedDict[str, set[str]] = OrderedDict()
+
+    def filter_new(self, session_id: str, hash_keys: list[str]) -> list[str]:
+        """Return the subset of hash_keys not yet injected for this session."""
+
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        with self._lock:
+            seen = self._sessions.get(session_id)
+            if seen is None:
+                return list(hash_keys)
+            return [h for h in hash_keys if h not in seen]
+
+    def record_injected(self, session_id: str, hash_keys: list[str]) -> None:
+        """Mark hash_keys as injected for this session."""
+
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        if not hash_keys:
+            return
+        with self._lock:
+            seen = self._sessions.get(session_id)
+            if seen is None:
+                seen = set()
+                self._sessions[session_id] = seen
+            seen.update(hash_keys)
+            self._sessions.move_to_end(session_id)
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+
+    def reset(self) -> None:
+        """Clear all session state."""
+
+        with self._lock:
+            self._sessions.clear()

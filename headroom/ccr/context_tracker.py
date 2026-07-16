@@ -88,6 +88,7 @@ class CompressedContext:
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
+    session_id: str | None = None  # Conversation identity (see analyze_query)
 
 
 @dataclass
@@ -167,6 +168,7 @@ class ContextTracker:
         compressed_count: int,
         *,
         workspace_key: str,
+        session_id: str | None = None,
         query_context: str = "",
         sample_content: str = "",
     ) -> None:
@@ -206,6 +208,7 @@ class ContextTracker:
             query_context=query_context,
             sample_content=sample_content[:2000],  # Limit sample size
             workspace_key=workspace_key,
+            session_id=session_id,
         )
 
         # Add or update context
@@ -232,6 +235,7 @@ class ContextTracker:
         current_turn: int | None = None,
         *,
         workspace_key: str,
+        session_id: str | None = None,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
 
@@ -277,6 +281,18 @@ class ContextTracker:
             # entries that belong to a different project than the one
             # the current request resolved to.
             if context.workspace_key != workspace_key:
+                continue
+
+            # Session filter (#2186): a NEW session (e.g. started after
+            # Claude Code's /compact) must not have old compressed content
+            # surfaced back into it — the whole point of compacting was to
+            # drop it. Only enforced when both sides have a concrete id;
+            # legacy/no-session callers keep workspace-only scoping.
+            if (
+                session_id is not None
+                and context.session_id is not None
+                and context.session_id != session_id
+            ):
                 continue
 
             # Check age
