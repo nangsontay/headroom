@@ -58,6 +58,34 @@ class TestPageTaxonomy:
         assert by_key["output_shaper"]["live"] is True
         assert by_key["target_ratio"]["live"] is False
 
+    def test_added_curated_knobs_on_expected_pages(self):
+        expected = {
+            "kompress_backend": "Compression",
+            "dedupe": "Compression",
+            "tool_search": "Compression",
+            "ccr_backend": "CCR & Caching",
+            "redis_url": "CCR & Caching",
+            "ccr_ttl_seconds": "CCR & Caching",
+            "stateless": "Networking & Security",
+            "offline": "Networking & Security",
+            "tls_strict": "Networking & Security",
+            "cors_origins": "Networking & Security",
+            "ws_origins": "Networking & Security",
+            "vertex_base_url": "Endpoints",
+            "bedrock_base_url": "Endpoints",
+            "gemini_base_url": "Endpoints",
+            "cloudcode_base_url": "Endpoints",
+            "qdrant_url": "Memory",
+            "qdrant_host": "Memory",
+            "qdrant_port": "Memory",
+            "qdrant_api_key": "Memory",
+        }
+        for key, page in expected.items():
+            field = settings_store._BY_KEY[key]
+            assert field.page == page, f"{key} -> {field.page!r}, expected {page!r}"
+            assert field.live is False, f"{key} should be restart-required, not live"
+        assert settings_store._BY_KEY["qdrant_api_key"].secret is True
+
 
 class TestLiveKnobs:
     def test_only_output_shaping_is_live(self):
@@ -122,3 +150,37 @@ class TestLivePersistence:
     def test_env_for(self):
         assert settings_store.env_for("output_shaper") == "HEADROOM_OUTPUT_SHAPER"
         assert settings_store.env_for("nope") is None
+
+
+class TestCuratedKnobBehavior:
+    def test_bool_knob_applies_to_environ_as_one(self, workspace):
+        settings_store.save({"stateless": True})
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_STATELESS"] == "1"
+
+    def test_tls_strict_defaults_true_and_serializes_off(self, workspace):
+        assert settings_store._BY_KEY["tls_strict"].default is True
+        # Relaxing it must serialize to "0", one of the reader's off-values.
+        settings_store.save({"tls_strict": False})
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_TLS_STRICT"] == "0"
+
+    def test_qdrant_port_range_enforced(self, workspace):
+        with pytest.raises(settings_store.SettingsValidationError):
+            settings_store.save({"qdrant_port": 70000})
+        settings_store.save({"qdrant_port": 6333})
+        assert settings_store.load()["qdrant_port"] == 6333
+
+    def test_kompress_backend_enum_rejects_unknown(self, workspace):
+        with pytest.raises(settings_store.SettingsValidationError):
+            settings_store.save({"kompress_backend": "cuda"})
+        settings_store.save({"kompress_backend": "pytorch_mps"})
+        assert settings_store.load()["kompress_backend"] == "pytorch_mps"
+
+    def test_qdrant_api_key_masked_in_schema(self, workspace):
+        settings_store.save({"qdrant_api_key": "qdr-secret-123"})
+        by_key = {f["key"]: f for f in settings_store.to_schema()["fields"]}
+        assert by_key["qdrant_api_key"]["value"] == settings_store._MASK
+        # Round-trips: resending the mask retains the stored secret.
+        settings_store.save({"qdrant_api_key": settings_store._MASK})
+        assert settings_store.load()["qdrant_api_key"] == "qdr-secret-123"
