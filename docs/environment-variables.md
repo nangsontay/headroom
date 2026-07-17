@@ -43,7 +43,12 @@ Output Shaping, Compression, CCR & Caching, Limits & Budget, Networking &
 Security, Endpoints, Memory, Observability — each with a collapsed-by-default
 Advanced section. Fields below are startup-captured (restart required to apply)
 **except** the Output Shaping knobs (§3), which are GUI-editable and apply live
-on Save. The Observability toggles (§10) are also GUI-editable now.
+on Save. The Observability toggles (§10) are also GUI-editable now. Beyond the
+tables in this section, the panel now also surfaces (all restart-required): the
+Kompress engine backend, cross-turn dedup and tool-search toggles (§6); the CCR
+storage backend, Redis URL and CCR TTL (§7); stateless/offline mode, strict-TLS,
+and CORS/WebSocket origins (§5); the Vertex/Bedrock/Gemini/Cloud Code base URLs
+(above); and the Qdrant URL/host/port/API-key (§9).
 `manifest_managed` fields are read-only on supervised Docker/service installs.
 
 ### Compression
@@ -136,6 +141,8 @@ on Save. The Observability toggles (§10) are also GUI-editable now.
 | `OPENAI_TARGET_API_HEADERS` | secret JSON | Extra headers merged into (and overriding) forwarded OpenAI requests. |
 | `VERTEX_TARGET_API_URL` | str | Custom Vertex AI regional API URL for publisher endpoints. |
 | `BEDROCK_TARGET_API_URL` | str | Custom AWS Bedrock API URL. |
+| `GEMINI_TARGET_API_URL` | str | Custom Gemini API base URL for passthrough endpoints. |
+| `CLOUDCODE_TARGET_API_URL` | str | Custom Cloud Code Assist API base URL for compatibility endpoints. |
 
 ---
 
