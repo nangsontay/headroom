@@ -55,6 +55,7 @@ and CORS/WebSocket origins (§5); the Vertex/Bedrock/Gemini/Cloud Code base URLs
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
+| `HEADROOM_MODE` | enum | `token` | Proxy posture: `token` (compress; history may be rewritten for max savings) or `cache` (freeze prior turns for provider prefix-cache stability). |
 | `HEADROOM_SAVINGS_PROFILE` | enum | `coding` | Named compression posture: `agent-90`, `balanced`, `coding`, `general`. |
 | `HEADROOM_TARGET_RATIO` | float 0-1 | adaptive | Kompress keep-ratio (lower = more aggressive). |
 | `HEADROOM_DISABLE_KOMPRESS` | bool | `false` | Disable Kompress ML compression (structural compression stays on). |
@@ -392,7 +393,7 @@ keys and header maps stay env-only and are never exposed in the GUI.
 
 | Variable | Description |
 |---|---|
-| `HEADROOM_MODE` | Proxy mode for the wrapped session: `audit`, `optimize`, `simulate`. |
+| `HEADROOM_MODE` | Proxy posture: `token` (prioritize compression) or `cache` (prioritize prefix-cache stability); aliases like `cost_savings`/`token_mode` are normalized. Read at startup, so also editable in the Settings GUI (§2 Compression). |
 | `HEADROOM_PROXY_URL` | URL of the proxy a wrapped CLI/agent should target. |
 | `HEADROOM_AGENT_TYPE` | Detected/declared wrapped-agent type (claude, codex, copilot, ...), used for telemetry. |
 | `HEADROOM_STACK` | Declared tech stack context for telemetry. |

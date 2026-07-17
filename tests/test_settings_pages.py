@@ -61,6 +61,7 @@ class TestPageTaxonomy:
     def test_added_curated_knobs_on_expected_pages(self):
         expected = {
             "kompress_backend": "Compression",
+            "mode": "Compression",
             "dedupe": "Compression",
             "tool_search": "Compression",
             "ccr_backend": "CCR & Caching",
@@ -184,3 +185,22 @@ class TestCuratedKnobBehavior:
         # Round-trips: resending the mask retains the stored secret.
         settings_store.save({"qdrant_api_key": settings_store._MASK})
         assert settings_store.load()["qdrant_api_key"] == "qdr-secret-123"
+
+
+class TestProxyModeKnob:
+    def test_mode_is_a_basic_compression_knob(self):
+        field = settings_store._BY_KEY["mode"]
+        assert field.env == "HEADROOM_MODE"
+        assert field.page == "Compression"
+        assert field.tier == "basic"
+        assert field.live is False
+
+    def test_mode_enum_roundtrip_and_apply(self, workspace):
+        settings_store.save({"mode": "cache"})
+        assert settings_store.load()["mode"] == "cache"
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_MODE"] == "cache"
+
+    def test_mode_rejects_unknown_value(self, workspace):
+        with pytest.raises(settings_store.SettingsValidationError):
+            settings_store.save({"mode": "turbo"})
