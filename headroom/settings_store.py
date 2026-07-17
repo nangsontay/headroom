@@ -112,7 +112,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "Proxy mode",
         "Compression",
         "enum",
-        default="token",
+        default="cache",
         choices=("token", "cache"),
         help="Proxy posture: token prioritizes compression (history may be rewritten for max "
         "savings); cache prioritizes provider prefix-cache stability (prior turns frozen).",

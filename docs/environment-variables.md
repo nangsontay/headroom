@@ -60,7 +60,7 @@ tool-result interception (§2 Compression); and the embedding-server sidecar (§
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `HEADROOM_MODE` | enum | `token` | Proxy posture: `token` (compress; history may be rewritten for max savings) or `cache` (freeze prior turns for provider prefix-cache stability). |
+| `HEADROOM_MODE` | enum | `cache` | Proxy posture: `token` (compress; history may be rewritten for max savings) or `cache` (freeze prior turns for provider prefix-cache stability). |
 | `HEADROOM_OPTIMIZE` | bool | `true` | Master optimization switch. `false` = passthrough (no compression); mirrors `--no-optimize`. |
 | `HEADROOM_CACHE_ENABLED` | bool | `true` | Semantic response cache. `false` mirrors `--no-cache`. |
 | `HEADROOM_RATE_LIMIT_ENABLED` | bool | `true` | Enforce RPM/TPM limits. `false` mirrors `--no-rate-limit`. |

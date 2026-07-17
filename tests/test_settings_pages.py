@@ -197,6 +197,7 @@ class TestProxyModeKnob:
     def test_mode_is_a_basic_compression_knob(self):
         field = settings_store._BY_KEY["mode"]
         assert field.env == "HEADROOM_MODE"
+        assert field.default == "cache"
         assert field.page == "Compression"
         assert field.tier == "basic"
         assert field.live is False
