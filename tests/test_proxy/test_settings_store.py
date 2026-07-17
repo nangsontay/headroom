@@ -1,7 +1,8 @@
 """Tests for the file-backed HEADROOM_* settings store (Phase 1).
 
 Covers: JSON round-trip with coercion, unknown-key drop, fail-open load on a
-corrupt file, atomic save, setdefault precedence (explicit export wins), the
+corrupt file, atomic save, settings-wins precedence (settings.json overrides an
+export; manifest_managed excepted), the
 effective-value resolution order, and secret masking in the schema/GET views.
 """
 
@@ -120,7 +121,16 @@ class TestApplyToEnviron:
         assert os.environ["HEADROOM_PORT"] == "9898"
         assert os.environ["HEADROOM_DISABLE_KOMPRESS"] == "1"
 
-    def test_explicit_export_wins(self, workspace, monkeypatch):
+    def test_stored_value_overrides_export(self, workspace, monkeypatch):
+        # settings.json is highest priority for a normal knob: it overrides a
+        # shell-exported env var.
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "general")
+        settings_store.apply_to_environ({"savings_profile": "balanced"})
+        assert os.environ["HEADROOM_SAVINGS_PROFILE"] == "balanced"
+
+    def test_manifest_managed_export_wins(self, workspace, monkeypatch):
+        # manifest_managed knobs are the exception: the exported value wins.
         _clear_env(monkeypatch)
         monkeypatch.setenv("HEADROOM_PORT", "7777")
         settings_store.apply_to_environ({"port": 9898})
@@ -133,16 +143,24 @@ class TestApplyToEnviron:
 
 
 class TestEffectiveValues:
-    def test_default_then_file_then_env(self, workspace, monkeypatch):
+    def test_default_then_env_then_file(self, workspace, monkeypatch):
         _clear_env(monkeypatch)
         # default
         assert settings_store.effective_values()["savings_profile"] == "coding"
-        # file overrides default
-        settings_store.save({"savings_profile": "balanced"})
-        assert settings_store.effective_values()["savings_profile"] == "balanced"
-        # env overrides file
+        # env overrides default
         monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "general")
         assert settings_store.effective_values()["savings_profile"] == "general"
+        # file (settings.json) is highest priority and wins over the env var
+        settings_store.save({"savings_profile": "balanced"})
+        assert settings_store.effective_values()["savings_profile"] == "balanced"
+
+    def test_manifest_managed_env_wins_over_file(self, workspace, monkeypatch):
+        # manifest_managed knobs invert the rule: the install manifest (env)
+        # keeps precedence over settings.json.
+        _clear_env(monkeypatch)
+        settings_store.save({"port": 9898})
+        monkeypatch.setenv("HEADROOM_PORT", "7777")
+        assert settings_store.effective_values()["port"] == 7777
 
 
 class TestSecretMasking:

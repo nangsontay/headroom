@@ -1,9 +1,11 @@
 """File-backed store for a curated subset of Headroom's runtime knobs (mostly ``HEADROOM_*``,
 
 The dashboard settings GUI persists these knobs to ``settings.json`` in the
-workspace dir and this module applies them to ``os.environ`` at CLI startup
-with ``os.environ.setdefault`` — so an explicit shell export always wins over
-the stored file. Precedence: ``export > settings.json > code default``.
+workspace dir and this module applies them to ``os.environ`` at CLI startup —
+the stored value wins over a shell export (``os.environ[...] = value``), so the
+GUI is authoritative. Precedence: ``CLI arg > settings.json > export > code
+default``. The exception is ``manifest_managed`` knobs, whose env is owned by the
+install manifest: there we ``setdefault`` so the export/manifest keeps priority.
 
 Deliberately dependency-light (stdlib + ``headroom.paths`` only, no FastAPI or
 proxy imports) so the early CLI apply hook — which must run
@@ -1342,32 +1344,58 @@ def save(values: dict[str, Any]) -> None:
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:
-    """``setdefault`` each stored value into ``os.environ`` (explicit export wins).
+    """Apply each stored value into ``os.environ``.
+
+    settings.json is the highest-priority source below an explicit CLI arg, so a
+    stored value *overrides* a shell-exported env var. ``manifest_managed`` knobs
+    are the exception: the install manifest (docker/service) owns their env, so
+    there we ``setdefault`` and let the exported value win.
 
     Live knobs are skipped: the proxy seeds them into the ``runtime_env``
-    override store at startup instead, so they stay GUI-editable (not
-    env-locked) while still surviving a restart.
+    override store at startup instead.
     """
     for key, value in values.items():
         field = _BY_KEY.get(key)
         if field is None or value is None or field.live:
             continue
-        os.environ.setdefault(field.env, _serialize(field, value))
+        if field.manifest_managed:
+            os.environ.setdefault(field.env, _serialize(field, value))
+        else:
+            os.environ[field.env] = _serialize(field, value)
 
 
 def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
-    """The value actually active now for each knob: default ← file ← environ."""
+    """The value actually active now for each knob.
+
+    settings.json is the highest-priority source, so for a normal knob the file
+    wins over the environment: default ← environ ← file. ``manifest_managed``
+    knobs are the exception — the install manifest (env) owns them, so there the
+    environment wins: default ← file ← environ.
+    """
     if stored is None:
         stored = load()
     result: dict[str, Any] = {}
     for field in SETTINGS:
-        value = stored[field.key] if field.key in stored else field.default
+        env_val: Any = None
         env_raw = os.environ.get(field.env)
         if env_raw is not None and env_raw != "":
             try:
-                value = _coerce(field, env_raw)
+                env_val = _coerce(field, env_raw)
             except (ValueError, TypeError):
-                pass  # unparseable env: keep the file/default value
+                env_val = None  # unparseable env: ignore it
+        has_file = field.key in stored
+        if field.manifest_managed:
+            # Install manifest (env) wins over the stored file.
+            value = stored[field.key] if has_file else field.default
+            if env_val is not None:
+                value = env_val
+        else:
+            # settings.json wins over the environment.
+            value = field.default
+            if env_val is not None:
+                value = env_val
+            if has_file:
+                value = stored[field.key]
         result[field.key] = value
     return result
 
@@ -1415,7 +1443,11 @@ def to_schema() -> dict[str, Any]:
                 "maximum": field.maximum,
                 "tier": field.tier,
                 "live": field.live,
-                "env_override": bool(os.environ.get(field.env)),
+                # settings.json wins over the environment, so an env var only
+                # *overrides* (locks) a knob when the install manifest owns it.
+                # ``env_present`` is purely informational for the UI.
+                "env_override": bool(field.manifest_managed and os.environ.get(field.env)),
+                "env_present": bool(os.environ.get(field.env)),
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
             }

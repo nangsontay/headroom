@@ -9,9 +9,12 @@ from `headroom/settings_store.py`; the rest are inferred from source context
 (comments, `Knob`/env-constant definitions) and may be experimental or
 undocumented elsewhere.
 
-**Precedence** (all resources): explicit CLI/SDK argument > shell-exported
-env var > `~/.headroom/settings.json` (GUI-managed subset only) > code
-default.
+**Precedence** (all resources): explicit CLI/SDK argument >
+`~/.headroom/settings.json` (GUI-managed subset) > shell-exported env var > code
+default. A saved GUI setting therefore overrides a shell export. The one
+exception is `manifest_managed` knobs (e.g. `HEADROOM_HOST`/`HEADROOM_PORT` on
+supervised Docker/service installs): the install manifest owns their env var, so
+there the exported value keeps precedence over `settings.json`.
 
 ---
 

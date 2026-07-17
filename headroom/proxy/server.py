@@ -2253,22 +2253,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
-    # (which already applies them before Click parsing). setdefault keeps
-    # explicit env exports authoritative; fail-open so it never blocks startup.
+    # (which already applies them before Click parsing). settings.json wins over
+    # a shell-exported env var here — highest priority below an explicit CLI arg;
+    # manifest_managed knobs keep the export. Fail-open so it never blocks startup.
     try:
         from headroom import settings_store
 
         stored = settings_store.load()
         settings_store.apply_to_environ(stored)
-        # Live (Output Shaping) knobs are intentionally NOT seeded into os.environ
+        # Live (Output Shaping) knobs are intentionally NOT written to os.environ
         # (that would env-lock them in the GUI). Seed them into the hot-reload
         # override store so persisted values stay active after a restart yet
-        # remain editable. An explicit shell export still wins, so skip any env
-        # var already set.
+        # remain editable. The override wins over os.environ, so the stored
+        # value takes precedence over a shell export, matching settings-first.
         _live_seed = settings_store.runtime_overrides(
             settings_store.live_keys(list(stored)), stored
         )
-        runtime_env.set_overrides({e: v for e, v in _live_seed.items() if not os.environ.get(e)})
+        runtime_env.set_overrides(_live_seed)
     except Exception:  # noqa: BLE001 — settings load must never break startup
         pass
 

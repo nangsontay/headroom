@@ -122,6 +122,9 @@
                                             <template x-if="field.env_override && !(field.manifest_managed && manifestManaged)">
                                                 <p class="text-xs text-amber-500/80 mt-1">Overridden by environment variable <code x-text="field.env"></code> -- edits here have no effect until it's unset.</p>
                                             </template>
+                                            <template x-if="field.env_present && !field.env_override">
+                                                <p class="text-xs field-help mt-1">Environment variable <code x-text="field.env"></code> is set — this panel takes precedence over it.</p>
+                                            </template>
                                             <template x-if="fieldErrors[field.key]">
                                                 <p class="text-xs text-red-500 mt-1" x-text="fieldErrors[field.key]"></p>
                                             </template>
@@ -183,6 +186,9 @@
                                                     </template>
                                                     <template x-if="field.env_override && !(field.manifest_managed && manifestManaged)">
                                                         <p class="text-xs text-amber-500/80 mt-1">Overridden by environment variable <code x-text="field.env"></code> -- edits here have no effect until it's unset.</p>
+                                                    </template>
+                                                    <template x-if="field.env_present && !field.env_override">
+                                                        <p class="text-xs field-help mt-1">Environment variable <code x-text="field.env"></code> is set — this panel takes precedence over it.</p>
                                                     </template>
                                                     <template x-if="fieldErrors[field.key]">
                                                         <p class="text-xs text-red-500 mt-1" x-text="fieldErrors[field.key]"></p>

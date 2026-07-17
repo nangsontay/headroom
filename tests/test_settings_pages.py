@@ -236,3 +236,24 @@ class TestCliArgToggles:
     def test_embedding_server_socket_str_roundtrip(self, workspace):
         settings_store.save({"embedding_server_socket": "/tmp/e.sock"})
         assert settings_store.load()["embedding_server_socket"] == "/tmp/e.sock"
+
+
+class TestSettingsWinPrecedence:
+    def test_stored_value_overrides_env_and_is_not_locked(self, workspace, monkeypatch):
+        # settings.json is highest priority for a normal knob.
+        monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "general")
+        settings_store.save({"savings_profile": "balanced"})
+        by_key = {f["key"]: f for f in settings_store.to_schema()["fields"]}
+        sp = by_key["savings_profile"]
+        assert sp["value"] == "balanced"  # file wins in the effective value
+        assert sp["env_override"] is False  # a normal knob is not env-locked
+        assert sp["env_present"] is True  # UI can still note the env var is set
+
+    def test_manifest_managed_env_still_wins_and_locks(self, workspace, monkeypatch):
+        # manifest_managed knobs keep env/manifest precedence and stay locked.
+        monkeypatch.setenv("HEADROOM_PORT", "7777")
+        settings_store.save({"port": 9898})
+        by_key = {f["key"]: f for f in settings_store.to_schema()["fields"]}
+        port = by_key["port"]
+        assert port["value"] == 7777
+        assert port["env_override"] is True
