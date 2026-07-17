@@ -360,6 +360,11 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
             def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001
                 pass
 
+            def prepare_turn(self, messages, tracker_frozen_count):  # noqa: ANN001
+                frozen = min(tracker_frozen_count, self.compute_frozen_count(messages))
+                self.mark_stable_from_messages(messages, frozen)
+                return frozen, self.apply_cached(messages)
+
         proxy._get_compression_cache = lambda session_id: _FakeCompressionCache()
 
         def _fake_apply(**kwargs):
@@ -942,6 +947,11 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
             def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001
                 pass
 
+            def prepare_turn(self, messages, tracker_frozen_count):  # noqa: ANN001
+                frozen = min(tracker_frozen_count, self.compute_frozen_count(messages))
+                self.mark_stable_from_messages(messages, frozen)
+                return frozen, self.apply_cached(messages)
+
         proxy._get_compression_cache = lambda session_id: _FakeCompressionCache()
 
         def _fake_apply(**kwargs):
@@ -1364,6 +1374,14 @@ class _IssueFakeCompCache:
 
     def mark_stable_from_messages(self, messages, up_to):  # noqa: ANN001
         self.calls.append(("mark_stable_from_messages", (up_to,), {}))
+
+    def prepare_turn(self, messages, tracker_frozen_count):  # noqa: ANN001
+        """Delegates to the instrumented sub-methods so `.calls` recording
+        and the should_defer_compression/mark_stable absence assertions
+        stay meaningful, unchanged."""
+        frozen = min(tracker_frozen_count, self.compute_frozen_count(messages))
+        self.mark_stable_from_messages(messages, frozen)
+        return frozen, self.apply_cached(messages)
 
     def update_from_result(self, originals, compressed):  # noqa: ANN001
         self.calls.append(("update_from_result", (), {}))

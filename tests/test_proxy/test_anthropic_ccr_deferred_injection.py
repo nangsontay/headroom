@@ -61,6 +61,11 @@ class _FakeCompressionCache:
     def mark_stable_from_messages(self, messages, frozen_count) -> None:  # noqa: ARG002
         return None
 
+    def prepare_turn(self, messages, tracker_frozen_count):  # noqa: ANN001
+        frozen = min(tracker_frozen_count, self.compute_frozen_count(messages))
+        self.mark_stable_from_messages(messages, frozen)
+        return frozen, self.apply_cached(messages)
+
     def update_from_result(self, originals, compressed) -> None:  # noqa: ARG002
         return None
 

@@ -1141,3 +1141,216 @@ def test_append_ccr_instructions_to_system_list_is_idempotent() -> None:
     mutated_again = _append_ccr_instructions_to_system(body)
     assert mutated_again is False
     assert len(body["system"]) == 2
+
+
+# ─── Phase 4: deferred waste-signal task (perf review F5) ──────────────────
+#
+# The gate itself (savings threshold + size limit, including the
+# waste_signal_token_limit override) lives in TransformPipeline.apply, which
+# attaches a waste_signals_provider closure to its result only when the gate
+# passes — see tests/test_transforms/test_pipeline_waste_signal_limit.py.
+# These tests cover the handler side: task creation, OTel recording, the
+# resolved value the outcome funnel collects, and fail-open behavior.
+
+
+def test_start_waste_signal_task_returns_none_without_provider(monkeypatch) -> None:
+    """No provider on the result (gate declined, or deferral off) → no task."""
+    handler = object.__new__(HeadroomProxy)
+    created: list = []
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.anthropic.asyncio.create_task",
+        lambda coro: created.append(coro),
+    )
+    assert (
+        handler._start_waste_signal_task(
+            SimpleNamespace(waste_signals_provider=None), model="m", provider_name="anthropic"
+        )
+        is None
+    )
+    assert handler._start_waste_signal_task(None, model="m", provider_name="anthropic") is None
+    assert created == []
+
+
+def test_start_waste_signal_task_records_metrics_and_resolves_dict(monkeypatch) -> None:
+    """Happy path: the task runs the pipeline's provider closure on the
+    background executor, records the narrow OTel counter (not
+    `record_pipeline_run`, which would double-count tokens/duration), and
+    resolves to the to_dict() form the outcome funnel collects."""
+    handler = object.__new__(HeadroomProxy)
+
+    async def _immediate_run(fn):  # noqa: ANN001, ANN202
+        return fn()
+
+    handler._run_compression_background = _immediate_run
+
+    recorded: dict = {}
+
+    def _fake_record_waste_signals(*, model, provider, waste_signals):  # noqa: ANN001
+        recorded["model"] = model
+        recorded["provider"] = provider
+        recorded["waste_signals"] = waste_signals
+
+    monkeypatch.setattr(
+        "headroom.observability.get_otel_metrics",
+        lambda: SimpleNamespace(record_waste_signals=_fake_record_waste_signals),
+    )
+
+    result = SimpleNamespace(
+        waste_signals_provider=lambda: SimpleNamespace(
+            total=lambda: 5, to_dict=lambda: {"duplicate_tool_result": 5}
+        )
+    )
+
+    async def _drive():
+        task = handler._start_waste_signal_task(
+            result, model="claude-sonnet", provider_name="anthropic"
+        )
+        assert task is not None
+        # Strong reference held until done (bare create_task is GC-unsafe).
+        assert task in handler._waste_signal_tasks
+        resolved = await task
+        assert resolved == {"duplicate_tool_result": 5}
+        await asyncio.sleep(0)  # let the done-callback run
+        assert task not in handler._waste_signal_tasks
+
+    asyncio.run(_drive())
+
+    assert recorded["model"] == "claude-sonnet"
+    assert recorded["provider"] == "anthropic"
+    assert recorded["waste_signals"] == {"duplicate_tool_result": 5}
+
+
+def test_start_waste_signal_task_skips_otel_when_provider_returns_none(monkeypatch) -> None:
+    """Provider ran but found nothing → resolve None, record nothing."""
+    handler = object.__new__(HeadroomProxy)
+
+    async def _immediate_run(fn):  # noqa: ANN001, ANN202
+        return fn()
+
+    handler._run_compression_background = _immediate_run
+
+    called: list = []
+    monkeypatch.setattr(
+        "headroom.observability.get_otel_metrics",
+        lambda: SimpleNamespace(record_waste_signals=lambda **k: called.append(k)),
+    )
+
+    async def _drive():
+        task = handler._start_waste_signal_task(
+            SimpleNamespace(waste_signals_provider=lambda: None),
+            model="m",
+            provider_name="anthropic",
+        )
+        assert await task is None
+
+    asyncio.run(_drive())
+    assert called == []
+
+
+def test_start_waste_signal_task_fails_open_on_parse_error(monkeypatch) -> None:
+    """Fail-open: an exception inside the provider must never propagate, must
+    not record metrics, and must resolve the task to None."""
+    handler = object.__new__(HeadroomProxy)
+
+    async def _immediate_run(fn):  # noqa: ANN001, ANN202
+        return fn()
+
+    handler._run_compression_background = _immediate_run
+
+    def _raise():  # noqa: ANN202
+        raise RuntimeError("boom")
+
+    called: list = []
+    monkeypatch.setattr(
+        "headroom.observability.get_otel_metrics",
+        lambda: SimpleNamespace(record_waste_signals=lambda **k: called.append(k)),
+    )
+
+    async def _drive():
+        task = handler._start_waste_signal_task(
+            SimpleNamespace(waste_signals_provider=_raise),
+            model="m",
+            provider_name="anthropic",
+        )
+        assert await task is None  # must not raise
+
+    asyncio.run(_drive())
+    assert called == []
+
+
+def _funnel_harness(seen: dict) -> SimpleNamespace:
+    class _Metrics:
+        async def record_request(self, **kwargs):  # noqa: ANN003, ANN202
+            seen["metrics_waste_signals"] = kwargs.get("waste_signals")
+
+        async def record_failed(self, **kwargs):  # noqa: ANN003, ANN202
+            raise AssertionError("should not be called for a 200 outcome")
+
+    class _Logger:
+        def log(self, request_log):  # noqa: ANN001, ANN202
+            seen["log_waste_signals"] = request_log.waste_signals
+
+    return SimpleNamespace(metrics=_Metrics(), cost_tracker=None, logger=_Logger())
+
+
+def _outcome_with_task(task):  # noqa: ANN001, ANN202
+    from headroom.proxy.outcome import RequestOutcome
+
+    return RequestOutcome(
+        request_id="r1",
+        provider="anthropic",
+        model="m",
+        original_tokens=100,
+        optimized_tokens=50,
+        output_tokens=10,
+        tokens_saved=50,
+        attempted_input_tokens=100,
+        waste_signals=None,
+        waste_signals_task=task,
+    )
+
+
+def test_emit_request_outcome_collects_finished_deferred_waste_signals() -> None:
+    """The outcome funnel picks up a completed deferred task's result and
+    feeds it to the metrics and request-log consumers, restoring the inline
+    path's funnel fidelity."""
+    from headroom.proxy.outcome import emit_request_outcome
+
+    seen: dict = {}
+    handler = _funnel_harness(seen)
+
+    async def _drive():
+        async def _signals() -> dict[str, int]:
+            return {"duplicate_tool_result": 3}
+
+        task = asyncio.create_task(_signals())
+        await task  # parse finished during the (much longer) upstream call
+        await emit_request_outcome(handler, _outcome_with_task(task))
+
+    asyncio.run(_drive())
+    assert seen["metrics_waste_signals"] == {"duplicate_tool_result": 3}
+    assert seen["log_waste_signals"] == {"duplicate_tool_result": 3}
+
+
+def test_emit_request_outcome_never_waits_on_pending_waste_task() -> None:
+    """Collection is done-only: a still-running task (busy background
+    executor) must not delay the response path — the funnel records None
+    and moves on immediately."""
+    from headroom.proxy.outcome import emit_request_outcome
+
+    seen: dict = {}
+    handler = _funnel_harness(seen)
+
+    async def _drive():
+        never_done: asyncio.Future = asyncio.get_running_loop().create_future()
+        task = asyncio.ensure_future(never_done)
+        try:
+            await asyncio.wait_for(
+                emit_request_outcome(handler, _outcome_with_task(task)), timeout=0.5
+            )
+        finally:
+            task.cancel()
+
+    asyncio.run(_drive())
+    assert seen["metrics_waste_signals"] is None
+    assert seen["log_waste_signals"] is None

@@ -885,11 +885,11 @@ class StreamingMixin:
         # outside the metric funnel. Run it before the funnel so the next
         # request inherits correct prefix state regardless of metric path.
         if prefix_tracker is not None:
-            import copy as _copy
-
             forwarded_messages = body.get("messages", [])
-            next_forwarded = _copy.deepcopy(forwarded_messages)
-            next_original = _copy.deepcopy(original_messages or forwarded_messages)
+            # Shallow outer-list copies only: update_from_response() makes
+            # the single defensive deepcopy at record time (perf review F1).
+            next_forwarded = list(forwarded_messages)
+            next_original = list(original_messages or forwarded_messages)
 
             if full_sse_data and provider == "anthropic":
                 _parsed = (
@@ -900,8 +900,8 @@ class StreamingMixin:
                 if _parsed:
                     asst_msg = self._assistant_message_from_response_json(_parsed)
                     if asst_msg is not None:
-                        next_forwarded.append(_copy.deepcopy(asst_msg))
-                        next_original.append(_copy.deepcopy(asst_msg))
+                        next_forwarded.append(asst_msg)
+                        next_original.append(asst_msg)
 
             # Cache-miss attribution (#1313), streaming Anthropic path. Mirror
             # the non-streaming handler: classify BEFORE update_from_response
@@ -1780,23 +1780,23 @@ class StreamingMixin:
                 # sibling). Run before the outcome funnel so prefix state
                 # is consistent regardless of metric path.
                 if prefix_tracker is not None:
-                    import copy as _copy
-
                     tracker_messages = (
                         optimized_messages
                         if optimized_messages is not None
                         else body.get("messages", [])
                     )
-                    next_forwarded = _copy.deepcopy(tracker_messages)
-                    next_original = _copy.deepcopy(original_messages or tracker_messages)
+                    # Shallow outer-list copies only: update_from_response() makes
+                    # the single defensive deepcopy at record time (perf review F1).
+                    next_forwarded = list(tracker_messages)
+                    next_original = list(original_messages or tracker_messages)
                     if full_sse_bytes:
                         parsed = self._parse_sse_to_response(
                             full_sse_bytes.decode("utf-8", errors="replace"), provider
                         )
                         asst_msg = self._assistant_message_from_response_json(parsed)
                         if asst_msg is not None:
-                            next_forwarded.append(_copy.deepcopy(asst_msg))
-                            next_original.append(_copy.deepcopy(asst_msg))
+                            next_forwarded.append(asst_msg)
+                            next_original.append(asst_msg)
                     cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
                     cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
                     if provider == "anthropic" and hasattr(prefix_tracker, "classify_cache_miss"):
