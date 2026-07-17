@@ -55,9 +55,50 @@ class SettingField:
     manifest_managed: bool = False
     minimum: float | None = None
     maximum: float | None = None
-    tier: str = "advanced"  # "basic" | "advanced" - Settings vs Advanced tab placement
+    tier: str = "advanced"  # "basic" | "advanced" — Normal vs Advanced within a page
+
+    @property
+    def page(self) -> str:
+        """Sidebar nav category, derived from ``group`` via ``_GROUP_TO_PAGE``."""
+        return _GROUP_TO_PAGE.get(self.group, "General")
+
+    @property
+    def live(self) -> bool:
+        """True when the knob applies via ``runtime_env`` with no restart."""
+        return self.page == "Output Shaping"
 
 
+# Sidebar nav order for the settings GUI. Each ``group`` maps to exactly one
+# page; several groups share a page (e.g. Limits + Budget). This tuple is the
+# single source of truth for page order — the UI renders pages in this sequence.
+PAGES: tuple[str, ...] = (
+    "General",
+    "Output Shaping",
+    "Compression",
+    "CCR & Caching",
+    "Limits & Budget",
+    "Networking & Security",
+    "Endpoints",
+    "Memory",
+    "Observability",
+)
+
+# Each field's ``group`` (its in-page sub-section header) maps to one nav page.
+_GROUP_TO_PAGE: dict[str, str] = {
+    "Backend": "General",
+    "Extensions": "General",
+    "Output Shaping": "Output Shaping",
+    "Compression": "Compression",
+    "CCR": "CCR & Caching",
+    "Limits": "Limits & Budget",
+    "Budget": "Limits & Budget",
+    "Networking": "Networking & Security",
+    "Timeouts": "Networking & Security",
+    "Endpoints": "Endpoints",
+    "Memory": "Memory",
+    "Logging": "Observability",
+    "Observability": "Observability",
+}
 # Curated registry. Env formats verified against each knob's Click option in
 # headroom/cli/proxy.py (bools serialize to "1"/"0", which Click's BOOL type and
 # the body-resolved HEADROOM_CODE_AWARE_ENABLED reader both accept).
@@ -130,7 +171,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "HEADROOM_NO_CCR",
         "no_ccr",
         "Disable CCR",
-        "Compression",
+        "CCR",
         "bool",
         default=False,
         help="Disable CCR entirely (no markers, no injected retrieve tool).",
@@ -250,6 +291,67 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Path for the message log file.",
         tier="basic",
     ),
+    # --- Observability (metrics / tracing / telemetry; restart-required) -----
+    SettingField(
+        "HEADROOM_OTEL_METRICS_ENABLED",
+        "otel_metrics_enabled",
+        "OpenTelemetry metrics",
+        "Observability",
+        "bool",
+        default=False,
+        help="Export OpenTelemetry metrics (requires the [otel] extra).",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_OTEL_METRICS_ENDPOINT",
+        "otel_metrics_endpoint",
+        "OTel metrics endpoint",
+        "Observability",
+        "str",
+        default=None,
+        help="OTLP metrics endpoint URL (e.g. http://localhost:4318/v1/metrics).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_OTEL_SERVICE_NAME",
+        "otel_service_name",
+        "OTel service name",
+        "Observability",
+        "str",
+        default=None,
+        help="service.name resource attribute for exported telemetry.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_LANGFUSE_ENABLED",
+        "langfuse_enabled",
+        "Langfuse tracing",
+        "Observability",
+        "bool",
+        default=False,
+        help="Send LLM traces to Langfuse (LANGFUSE_* keys stay env-only).",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_TELEMETRY",
+        "telemetry",
+        "Anonymous usage telemetry",
+        "Observability",
+        "optional-bool",
+        default=None,
+        help="Opt in/out of the anonymous usage beacon. Unset = off (opt-in).",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_PERIODIC_TOIN_STATS",
+        "periodic_toin_stats",
+        "Periodic TOIN stats",
+        "Observability",
+        "bool",
+        default=True,
+        help="Log periodic tokens-out/-in efficiency stats.",
+        tier="advanced",
+    ),
     # --- Networking (upstream connection pool tuning) ---
     SettingField(
         "HEADROOM_MAX_CONNECTIONS",
@@ -309,7 +411,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
         "no_ccr_proactive_expansion",
         "Disable CCR proactive expansion",
-        "Compression",
+        "CCR",
         "bool",
         default=False,
         help="Disable proactive expansion of previously compressed content.",
@@ -668,6 +770,86 @@ SETTINGS: tuple[SettingField, ...] = (
         help="JSON object of extra headers merged into (and overriding) forwarded OpenAI requests.",
         tier="advanced",
     ),
+    # --- Output Shaping (live: applied via runtime_env, no restart) ----------
+    # These mirror headroom/proxy/runtime_env.py RUNTIME_ENV_KNOBS. A save
+    # persists to settings.json AND hot-reloads through set_overrides(), so it
+    # takes effect on the next request. Unset means "adaptive default", so the
+    # boolean knobs are optional-bool (unset is distinct from an explicit off).
+    SettingField(
+        "HEADROOM_OUTPUT_SHAPER",
+        "output_shaper",
+        "Output shaping",
+        "Output Shaping",
+        "optional-bool",
+        default=None,
+        help="Master switch for output-token shaping. Unset = adaptive default.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_VERBOSITY_LEVEL",
+        "verbosity_level",
+        "Verbosity level",
+        "Output Shaping",
+        "int",
+        default=None,
+        minimum=0,
+        maximum=4,
+        help="Verbosity steering level 0-4. Unset = learned/default.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_EFFORT_ROUTER",
+        "effort_router",
+        "Effort router",
+        "Output Shaping",
+        "optional-bool",
+        default=None,
+        help="Lower effort on mechanical tool-result continuations. Unset = adaptive.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_MECHANICAL_EFFORT",
+        "mechanical_effort",
+        "Mechanical effort",
+        "Output Shaping",
+        "str",
+        default=None,
+        help="Effort value used on mechanical continuations (e.g. low, medium, high).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_VERBOSITY_AUTOTUNE",
+        "verbosity_autotune",
+        "Verbosity autotune",
+        "Output Shaping",
+        "optional-bool",
+        default=None,
+        help="Use the AIMD verbosity controller state. Unset = adaptive.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_OUTPUT_HOLDOUT",
+        "output_holdout",
+        "Output holdout fraction",
+        "Output Shaping",
+        "float",
+        default=None,
+        minimum=0.0,
+        maximum=1.0,
+        help="Fraction of conversations held out for A/B measurement (0-1).",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_INTERCEPT_READ_MIN_CHARS",
+        "intercept_read_min_chars",
+        "Read-rewrite min chars",
+        "Output Shaping",
+        "int",
+        default=None,
+        minimum=0,
+        help="Minimum tool-output chars before the ast-grep read rewrite.",
+        tier="advanced",
+    ),
 )
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
@@ -874,10 +1056,15 @@ def save(values: dict[str, Any]) -> None:
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:
-    """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
+    """``setdefault`` each stored value into ``os.environ`` (explicit export wins).
+
+    Live knobs are skipped: the proxy seeds them into the ``runtime_env``
+    override store at startup instead, so they stay GUI-editable (not
+    env-locked) while still surviving a restart.
+    """
     for key, value in values.items():
         field = _BY_KEY.get(key)
-        if field is None or value is None:
+        if field is None or value is None or field.live:
             continue
         os.environ.setdefault(field.env, _serialize(field, value))
 
@@ -916,8 +1103,10 @@ def stored_values(mask_secrets: bool = True) -> dict[str, Any]:
 def to_schema() -> dict[str, Any]:
     """Registry + grouped fields + effective values for the UI. Secrets masked.
 
-    All curated knobs are startup-captured, so every key is restart-required;
-    ``needs_restart_keys`` lists them for the UI's "restart to apply" banner.
+    Each field carries ``page`` (sidebar nav category) and ``group`` (in-page
+    sub-section header); ``pages`` lists the populated pages in nav order.
+    ``live`` knobs apply via ``runtime_env`` with no restart, so only non-live
+    keys land in ``needs_restart_keys`` for the UI's "restart to apply" banner.
     """
     stored = load()
     effective = effective_values(stored)
@@ -929,6 +1118,7 @@ def to_schema() -> dict[str, Any]:
                 "env": field.env,
                 "label": field.label,
                 "group": field.group,
+                "page": field.page,
                 "type": field.type,
                 "choices": list(field.choices),
                 "default": field.default,
@@ -938,6 +1128,7 @@ def to_schema() -> dict[str, Any]:
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
+                "live": field.live,
                 "env_override": bool(os.environ.get(field.env)),
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
@@ -947,9 +1138,58 @@ def to_schema() -> dict[str, Any]:
     for field in SETTINGS:
         if field.group not in groups:
             groups.append(field.group)
+    populated = {field.page for field in SETTINGS}
+    pages = [page for page in PAGES if page in populated]
     return {
+        "pages": pages,
         "groups": groups,
         "fields": fields,
         "values": {f["key"]: f["value"] for f in fields},
-        "needs_restart_keys": [field.key for field in SETTINGS],
+        "needs_restart_keys": [field.key for field in SETTINGS if not field.live],
     }
+
+
+def live_keys(keys: list[str]) -> list[str]:
+    """Subset of ``keys`` whose registry field applies live (no restart)."""
+    return [key for key in keys if (f := _BY_KEY.get(key)) is not None and f.live]
+
+
+def coerce_env_value(key: str, raw: str | None) -> Any:
+    """Coerce a raw env string to registry ``key``'s typed value (for display).
+
+    Returns ``None`` when ``raw`` is unset/empty, or the key is unknown or the
+    value unparseable. Lets the ``/settings/schema`` handler reflect a live
+    ``runtime_env`` override as the field's typed value without importing the
+    proxy into this dependency-light module.
+    """
+    if raw is None or raw == "":
+        return None
+    field = _BY_KEY.get(key)
+    if field is None:
+        return None
+    try:
+        return _coerce(field, raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def runtime_overrides(keys: list[str], values: dict[str, Any]) -> dict[str, str]:
+    """Map live registry ``keys`` to ``{env: serialized}`` for a hot-reload push.
+
+    ``values`` is a coerced stored dict (e.g. from :func:`load`). Non-live or
+    unknown keys, and keys absent from ``values``, are skipped — so the result
+    is exactly what ``runtime_env.set_overrides`` should apply after a save.
+    """
+    out: dict[str, str] = {}
+    for key in keys:
+        field = _BY_KEY.get(key)
+        if field is None or not field.live or key not in values:
+            continue
+        out[field.env] = _serialize(field, values[key])
+    return out
+
+
+def env_for(key: str) -> str | None:
+    """Return the ``HEADROOM_*`` env var name for a registry ``key`` (or None)."""
+    field = _BY_KEY.get(key)
+    return field.env if field is not None else None

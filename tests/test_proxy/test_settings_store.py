@@ -168,10 +168,14 @@ class TestSecretMasking:
         # unmasked read still returns the real value for internal callers
         assert settings_store.stored_values(mask_secrets=False)["log_file"] == "/tmp/secret.log"
 
-    def test_schema_lists_all_keys_as_restart_required(self, workspace, monkeypatch):
+    def test_schema_marks_non_live_keys_restart_required(self, workspace, monkeypatch):
         _clear_env(monkeypatch)
         schema = settings_store.to_schema()
-        assert schema["needs_restart_keys"] == [f.key for f in settings_store.SETTINGS]
+        # Every startup-captured (non-live) key needs a restart; live knobs do not.
+        assert schema["needs_restart_keys"] == [
+            f.key for f in settings_store.SETTINGS if not f.live
+        ]
+        assert all(not settings_store._BY_KEY[k].live for k in schema["needs_restart_keys"])
         assert "Compression" in schema["groups"]
 
     def test_anthropic_extra_headers_retain_on_mask(self, workspace, monkeypatch):

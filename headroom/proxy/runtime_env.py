@@ -126,6 +126,17 @@ def clear_overrides() -> None:
         _overrides.clear()
 
 
+def clear_override(name: str) -> bool:
+    """Drop a single override so ``getenv`` falls back to the environment.
+
+    Returns True if an override was present. Used when a live knob is unset in
+    the settings GUI: removing the override (rather than pushing ``""``) lets
+    the reader see the value as genuinely absent again.
+    """
+    with _lock:
+        return _overrides.pop(name, None) is not None
+
+
 def explicit_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """Knobs *explicitly* set (non-empty) in ``environ`` — the wrap push payload.
 

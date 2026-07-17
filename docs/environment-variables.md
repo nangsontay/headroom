@@ -38,7 +38,12 @@ See `wiki/filesystem-contract.md` for the full bucket table and precedence chain
 ## 2. Settings GUI knobs (curated, `~/.headroom/settings.json`)
 
 Editable at `http://127.0.0.1:<port>/dashboard/settings` without hand-exporting
-env vars. Every field here is startup-captured (restart required to apply).
+env vars. The GUI groups these onto feature pages in a left sidebar — General,
+Output Shaping, Compression, CCR & Caching, Limits & Budget, Networking &
+Security, Endpoints, Memory, Observability — each with a collapsed-by-default
+Advanced section. Fields below are startup-captured (restart required to apply)
+**except** the Output Shaping knobs (§3), which are GUI-editable and apply live
+on Save. The Observability toggles (§10) are also GUI-editable now.
 `manifest_managed` fields are read-only on supervised Docker/service installs.
 
 ### Compression
@@ -138,7 +143,9 @@ env vars. Every field here is startup-captured (restart required to apply).
 
 Read on every request via `headroom/proxy/runtime_env.py` — `headroom wrap`
 pushes new values via `POST /admin/runtime-env` so a reused proxy picks them
-up without a restart.
+up without a restart. These are also GUI-editable on the **Output Shaping**
+page, where Save persists them to `settings.json` and applies them live (no
+restart) through the same override store.
 
 | Variable | Type | Description |
 |---|---|---|
@@ -284,6 +291,12 @@ selection* for the `HEADROOM_KOMPRESS_BACKEND` value table (`auto`, `onnx`,
 ---
 
 ## 10. Observability / telemetry
+
+The curated subset below — `HEADROOM_OTEL_METRICS_ENABLED`,
+`HEADROOM_OTEL_METRICS_ENDPOINT`, `HEADROOM_OTEL_SERVICE_NAME`,
+`HEADROOM_LANGFUSE_ENABLED`, `HEADROOM_TELEMETRY`, `HEADROOM_PERIODIC_TOIN_STATS`
+— is GUI-editable on the **Observability** page (restart required). Langfuse/OTel
+keys and header maps stay env-only and are never exposed in the GUI.
 
 ### OpenTelemetry metrics
 
