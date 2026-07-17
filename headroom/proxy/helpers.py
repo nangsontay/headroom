@@ -78,6 +78,9 @@ from headroom.proxy.ccr_marker_policy import (
     should_inject_ccr_tool as _should_inject_ccr_tool,
 )
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
+from headroom.proxy.ccr_session_tracker import (
+    SessionExpansionDedupTracker as _SessionExpansionDedupTracker,
+)
 from headroom.proxy.internal_header_policy import (
     INTERNAL_HEADER_PREFIX,
     STRIP_INTERNAL_HEADERS_DEFAULT,
@@ -378,6 +381,41 @@ def log_memory_injection(
         bytes_injected,
         query_hash,
     )
+
+
+def injection_target_already_forwarded(
+    messages: list[dict[str, Any]],
+    *,
+    prefix_tracker: Any,
+    current_original_messages: list[dict[str, Any]],
+) -> bool:
+    """True when appending to ``messages[-1]`` would double-inject.
+
+    Shared guard for CCR proactive-expansion and memory-context injection on
+    both the Anthropic and OpenAI paths: all of them append to the tail
+    message via a provider-specific "append to latest user turn" helper. On a
+    same-messages re-request (or any turn whose tail position was already
+    part of last turn's forwarded output), ``overlay_cached_prefix`` has
+    already replayed that position's bytes byte-identical — including
+    whatever was injected into it last turn. Injecting again there would
+    append a second copy and bust the cache from that point on (#2186).
+
+    "Already forwarded" = the tail index falls within last turn's forwarded
+    message count AND this turn's originals are a full append-only extension
+    of last turn's originals — the same condition under which the overlay
+    actually replayed that position (see
+    ``headroom.cache.prefix_tracker.is_append_only_extension``).
+    """
+    from headroom.cache.prefix_tracker import is_append_only_extension
+
+    target_index = len(messages) - 1
+    if target_index < 0:
+        return False
+    previous_forwarded = prefix_tracker.get_last_forwarded_messages()
+    if target_index >= len(previous_forwarded):
+        return False
+    previous_original = prefix_tracker.get_last_original_messages()
+    return is_append_only_extension(current_original_messages, previous_original)
 
 
 def append_text_to_latest_user_chat_message(
@@ -2229,6 +2267,29 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+# Process-wide singleton for per-session CCR proactive-expansion dedup (#2186).
+_session_expansion_dedup_tracker_lock = threading.Lock()
+_session_expansion_dedup_tracker: _SessionExpansionDedupTracker | None = None
+
+
+def get_session_expansion_dedup_tracker() -> _SessionExpansionDedupTracker:
+    """Return the process-wide :class:`SessionExpansionDedupTracker` singleton."""
+    global _session_expansion_dedup_tracker
+    with _session_expansion_dedup_tracker_lock:
+        if _session_expansion_dedup_tracker is None:
+            _session_expansion_dedup_tracker = _SessionExpansionDedupTracker(
+                max_sessions=get_tool_tracker_max_sessions()
+            )
+        return _session_expansion_dedup_tracker
+
+
+def _reset_session_expansion_dedup_tracker_for_test() -> None:
+    """Clear the process-wide expansion-dedup tracker (test-only)."""
+    global _session_expansion_dedup_tracker
+    with _session_expansion_dedup_tracker_lock:
+        _session_expansion_dedup_tracker = None
 
 
 def has_new_ccr_markers(
