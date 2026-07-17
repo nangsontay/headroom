@@ -987,6 +987,75 @@ SETTINGS: tuple[SettingField, ...] = (
         help="API key for hosted Qdrant (e.g. Qdrant Cloud).",
         tier="advanced",
     ),
+    # --- CLI-arg toggles (env-backed; restart-required) ---------------------
+    # These mirror `headroom proxy` flags that resolve from an env var, so the
+    # settings.json -> setdefault path reaches them.
+    # Compression page
+    SettingField(
+        "HEADROOM_OPTIMIZE",
+        "optimize",
+        "Optimization enabled",
+        "Compression",
+        "bool",
+        default=True,
+        help="Master switch. Off = passthrough mode (no compression/optimization); mirrors --no-optimize.",
+        tier="basic",
+    ),
+    # Compression page (tool_result interception is a startup-read transform, so
+    # it must NOT sit on the Output Shaping page, whose fields are auto-live).
+    SettingField(
+        "HEADROOM_INTERCEPT_ENABLED",
+        "intercept_enabled",
+        "Tool-result interception",
+        "Compression",
+        "bool",
+        default=False,
+        help="Enable ast-grep tool_result interceptors (Read outliner, etc.); mirrors --intercept-tool-results.",
+        tier="advanced",
+    ),
+    # CCR & Caching page
+    SettingField(
+        "HEADROOM_CACHE_ENABLED",
+        "cache_enabled",
+        "Semantic cache enabled",
+        "CCR",
+        "bool",
+        default=True,
+        help="Semantic response cache. Off mirrors --no-cache.",
+        tier="basic",
+    ),
+    # Limits & Budget page
+    SettingField(
+        "HEADROOM_RATE_LIMIT_ENABLED",
+        "rate_limit_enabled",
+        "Rate limiting enabled",
+        "Limits",
+        "bool",
+        default=True,
+        help="Enforce RPM/TPM limits. Off mirrors --no-rate-limit.",
+        tier="basic",
+    ),
+    # Memory page (out-of-process embedding server sidecar)
+    SettingField(
+        "HEADROOM_EMBEDDING_SERVER",
+        "embedding_server",
+        "Embedding server sidecar",
+        "Memory",
+        "bool",
+        default=False,
+        help="Run a shared out-of-process embedder across workers (saves ~600 MB RSS); mirrors --embedding-server.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_EMBEDDING_SERVER_SOCKET",
+        "embedding_server_socket",
+        "Embedding server socket",
+        "Memory",
+        "str",
+        default=None,
+        help="Unix socket path for the embedding sidecar. Default: /tmp/headroom-embed-<port>.sock.",
+        tier="advanced",
+    ),
     # --- Output Shaping (live: applied via runtime_env, no restart) ----------
     # These mirror headroom/proxy/runtime_env.py RUNTIME_ENV_KNOBS. A save
     # persists to settings.json AND hot-reloads through set_overrides(), so it

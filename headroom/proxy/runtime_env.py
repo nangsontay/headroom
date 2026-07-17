@@ -103,7 +103,7 @@ def getenv(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name, default)
 
 
-def set_overrides(values: dict[str, object]) -> dict[str, str]:
+def set_overrides(values: Mapping[str, object]) -> dict[str, str]:
     """Apply hot-reload overrides for known knobs. Returns what was applied.
 
     Unknown keys and non-string values are ignored (the endpoint is loopback-only

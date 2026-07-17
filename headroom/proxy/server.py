@@ -846,7 +846,12 @@ class HeadroomProxy(
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
         _intercept_prefix: list = []
-        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+        if os.environ.get("HEADROOM_INTERCEPT_ENABLED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             _intercept_prefix = [ToolResultInterceptorTransform()]
