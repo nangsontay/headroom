@@ -105,6 +105,18 @@ _GROUP_TO_PAGE: dict[str, str] = {
 SETTINGS: tuple[SettingField, ...] = (
     # --- Compression ---
     SettingField(
+        "HEADROOM_MODE",
+        "mode",
+        "Proxy mode",
+        "Compression",
+        "enum",
+        default="token",
+        choices=("token", "cache"),
+        help="Proxy posture: token prioritizes compression (history may be rewritten for max "
+        "savings); cache prioritizes provider prefix-cache stability (prior turns frozen).",
+        tier="basic",
+    ),
+    SettingField(
         "HEADROOM_SAVINGS_PROFILE",
         "savings_profile",
         "Savings profile",
