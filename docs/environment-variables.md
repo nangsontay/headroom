@@ -48,7 +48,9 @@ tables in this section, the panel now also surfaces (all restart-required): the
 Kompress engine backend, cross-turn dedup and tool-search toggles (§6); the CCR
 storage backend, Redis URL and CCR TTL (§7); stateless/offline mode, strict-TLS,
 and CORS/WebSocket origins (§5); the Vertex/Bedrock/Gemini/Cloud Code base URLs
-(above); and the Qdrant URL/host/port/API-key (§9).
+(above); the Qdrant URL/host/port/API-key (§9); the proxy mode and the core
+CLI toggles — optimization, semantic cache, and rate-limiting on/off, plus
+tool-result interception (§2 Compression); and the embedding-server sidecar (§9).
 `manifest_managed` fields are read-only on supervised Docker/service installs.
 
 ### Compression
@@ -56,6 +58,10 @@ and CORS/WebSocket origins (§5); the Vertex/Bedrock/Gemini/Cloud Code base URLs
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `HEADROOM_MODE` | enum | `token` | Proxy posture: `token` (compress; history may be rewritten for max savings) or `cache` (freeze prior turns for provider prefix-cache stability). |
+| `HEADROOM_OPTIMIZE` | bool | `true` | Master optimization switch. `false` = passthrough (no compression); mirrors `--no-optimize`. |
+| `HEADROOM_CACHE_ENABLED` | bool | `true` | Semantic response cache. `false` mirrors `--no-cache`. |
+| `HEADROOM_RATE_LIMIT_ENABLED` | bool | `true` | Enforce RPM/TPM limits. `false` mirrors `--no-rate-limit`. |
+| `HEADROOM_INTERCEPT_ENABLED` | bool | `false` | Enable ast-grep tool_result interceptors (Read outliner); mirrors `--intercept-tool-results`. |
 | `HEADROOM_SAVINGS_PROFILE` | enum | `coding` | Named compression posture: `agent-90`, `balanced`, `coding`, `general`. |
 | `HEADROOM_TARGET_RATIO` | float 0-1 | adaptive | Kompress keep-ratio (lower = more aggressive). |
 | `HEADROOM_DISABLE_KOMPRESS` | bool | `false` | Disable Kompress ML compression (structural compression stays on). |
@@ -164,7 +170,6 @@ restart) through the same override store.
 | `HEADROOM_VERBOSITY_AUTOTUNE` | bool | Use the AIMD verbosity controller state. |
 | `HEADROOM_OUTPUT_HOLDOUT` | float | Fraction of conversations held out for A/B measurement. |
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | int | Min tool-output chars before the ast-grep read rewrite. |
-| `HEADROOM_INTERCEPT_ENABLED` | bool | Enable ast-grep-based tool-result interception/rewrite. |
 
 ---
 
@@ -286,6 +291,7 @@ selection* for the `HEADROOM_KOMPRESS_BACKEND` value table (`auto`, `onnx`,
 |---|---|
 | `HEADROOM_EMBEDDER_RUNTIME` | Set `pytorch_mps` to run the memory embedder on Apple GPU (requires `[pytorch-mps]` extra, MPS-availability-gated). |
 | `HEADROOM_EMBEDDING_SERVER_SOCKET` | Unix socket path for the out-of-process embedding server. |
+| `HEADROOM_EMBEDDING_SERVER` | Run a shared out-of-process embedding server sidecar across workers (saves ~600 MB RSS). GUI-editable (§2 Memory). |
 | `HEADROOM_EMBED_CONCURRENCY` | Max concurrent embedding calls. |
 | `HEADROOM_EMBED_NUM_THREADS` | Thread count for the embedding backend. |
 | `HEADROOM_QDRANT_URL` | Full Qdrant URL (e.g. hosted Qdrant Cloud). |

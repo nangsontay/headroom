@@ -80,6 +80,12 @@ class TestPageTaxonomy:
             "qdrant_host": "Memory",
             "qdrant_port": "Memory",
             "qdrant_api_key": "Memory",
+            "optimize": "Compression",
+            "intercept_enabled": "Compression",
+            "cache_enabled": "CCR & Caching",
+            "rate_limit_enabled": "Limits & Budget",
+            "embedding_server": "Memory",
+            "embedding_server_socket": "Memory",
         }
         for key, page in expected.items():
             field = settings_store._BY_KEY[key]
@@ -204,3 +210,29 @@ class TestProxyModeKnob:
     def test_mode_rejects_unknown_value(self, workspace):
         with pytest.raises(settings_store.SettingsValidationError):
             settings_store.save({"mode": "turbo"})
+
+
+class TestCliArgToggles:
+    def test_positive_toggles_default_enabled(self):
+        for key in ("optimize", "cache_enabled", "rate_limit_enabled"):
+            assert settings_store._BY_KEY[key].default is True, key
+
+    def test_disable_toggle_serializes_zero(self, workspace):
+        settings_store.save({"optimize": False, "cache_enabled": False})
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_OPTIMIZE"] == "0"
+        assert os.environ["HEADROOM_CACHE_ENABLED"] == "0"
+
+    def test_intercept_and_embedding_server_are_bools(self):
+        assert settings_store._BY_KEY["intercept_enabled"].type == "bool"
+        assert settings_store._BY_KEY["intercept_enabled"].default is False
+        assert settings_store._BY_KEY["embedding_server"].default is False
+
+    def test_intercept_enabled_applies_as_one(self, workspace):
+        settings_store.save({"intercept_enabled": True})
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_INTERCEPT_ENABLED"] == "1"
+
+    def test_embedding_server_socket_str_roundtrip(self, workspace):
+        settings_store.save({"embedding_server_socket": "/tmp/e.sock"})
+        assert settings_store.load()["embedding_server_socket"] == "/tmp/e.sock"

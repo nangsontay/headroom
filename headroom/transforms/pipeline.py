@@ -144,9 +144,13 @@ class TransformPipeline:
         # users try it and compare before we make it the default.
         import os as _os
 
-        if getattr(self.config, "intercept_tool_results", False) or _os.environ.get(
-            "HEADROOM_INTERCEPT_ENABLED"
-        ):
+        _intercept_env = _os.environ.get("HEADROOM_INTERCEPT_ENABLED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if getattr(self.config, "intercept_tool_results", False) or _intercept_env:
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             transforms.append(ToolResultInterceptorTransform())
