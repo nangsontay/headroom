@@ -321,6 +321,17 @@ class ProxyConfig:
     # CLI: --proxy-extension <name1,name2>; env: HEADROOM_PROXY_EXTENSIONS.
     proxy_extensions: list[str] | None = None
 
+    # Compressor selection (opt-in narrowing of the built-in compressor set).
+    # None (the default) leaves EVERY built-in compressor enabled — byte-
+    # identical to today. When a set is given, only the named recognized
+    # built-ins {smart_crusher, kompress, code_aware, search, log, tabular,
+    # config, html, image} stay enabled and the rest are disabled at the
+    # ContentRouterConfig `enable_*` seam; `"*"` enables all. Names that are
+    # not recognized built-ins are ignored here (reserved for the
+    # `headroom.compressor` registry). CLI: --compressor <name1,name2>
+    # (repeatable); env: HEADROOM_COMPRESSORS.
+    compressors: set[str] | None = None
+
     # Fallback
     fallback_enabled: bool = False
     fallback_provider: str | None = None

@@ -653,6 +653,93 @@ def _provider_httpx_client_options(
     return config.http2 and not config.http_proxy, client_kwargs
 
 
+# Recognized built-in compressor names → the `ContentRouterConfig` `enable_*`
+# flag that gates each one. This is the whole selection surface: a `--compressor`
+# selection is mapped onto these existing flags with ZERO new dispatch logic, so
+# the router's if/elif built-in dispatch stays byte-identical. Names outside this
+# map (e.g. a third-party `headroom.compressor` entry point) are intentionally
+# ignored here — they belong to the registry, not the built-in enable_* seam.
+BUILTIN_COMPRESSOR_FLAGS: dict[str, str] = {
+    "smart_crusher": "enable_smart_crusher",
+    "kompress": "enable_kompress",
+    "code_aware": "enable_code_aware",
+    "search": "enable_search_compressor",
+    "log": "enable_log_compressor",
+    "tabular": "enable_tabular_compressor",
+    "config": "enable_config_compressor",
+    "html": "enable_html_extractor",
+    "image": "enable_image_optimizer",
+}
+
+
+def _apply_compressor_selection(
+    router_config: ContentRouterConfig,
+    compressors: set[str] | None,
+) -> None:
+    """Narrow the built-in compressor set on ``router_config`` in place.
+
+    ``compressors is None`` (the default) is a no-op: every ``enable_*`` flag
+    keeps its dataclass default, so behavior is byte-identical to today. When a
+    selection is given, each recognized built-in in :data:`BUILTIN_COMPRESSOR_FLAGS`
+    is enabled iff it (or the wildcard ``"*"``) was selected, and disabled
+    otherwise. Unrecognized names select no flag (reserved for the compressor
+    registry) but are surfaced with a warning, because a typo'd selection is
+    otherwise indistinguishable from "compress nothing" (#2384). This maps a
+    selection onto the existing flags without adding any dispatch logic.
+    """
+    if compressors is None:
+        return
+    selected = {name.strip() for name in compressors if name.strip()}
+    if not selected:
+        return
+    select_all = "*" in selected
+    unmatched = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS) - {"*"})
+    if unmatched:
+        if select_all or selected & set(BUILTIN_COMPRESSOR_FLAGS):
+            logger.warning(
+                "compressor selection: %s match no built-in compressor "
+                "(assumed registry names); built-ins: %s",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+        else:
+            logger.warning(
+                "compressor selection %s matches no built-in compressor — every "
+                "built-in compressor is now disabled. If this is a typo, valid "
+                "names are: %s (or '*' for all).",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+    for name, flag in BUILTIN_COMPRESSOR_FLAGS.items():
+        setattr(router_config, flag, select_all or name in selected)
+
+
+def _external_compressor_selection(compressors: set[str] | None) -> list[str] | None:
+    """Return the selected EXTERNAL (non-built-in) compressor names, or ``None``.
+
+    The built-in selection (:func:`_apply_compressor_selection`) consumes only
+    the names in :data:`BUILTIN_COMPRESSOR_FLAGS`; every OTHER selected name is a
+    third-party ``headroom.compressor`` entry point. This threads those to the
+    router (via ``ContentRouterConfig.active_external_compressors``) so it can
+    route matching blocks through them.
+
+    Returns ``None`` — the router's external-dispatch branch stays inert, so the
+    request path is byte-identical to today — when the selection is empty or
+    contains only recognized built-in names. ``"*"`` is preserved so the router
+    activates every discovered external compressor (mirroring the wildcard's
+    "select everything" meaning on the built-in side).
+    """
+    if not compressors:
+        return None
+    selected = {name.strip() for name in compressors if name.strip()}
+    if not selected:
+        return None
+    if "*" in selected:
+        return ["*"]
+    external = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS))
+    return external or None
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -751,6 +838,19 @@ class HeadroomProxy(
             ccr_inject_marker=config.ccr_inject_marker,
             force_kompress_all=config.force_kompress_all,
             lossless=config.lossless,
+        )
+        # Compressor selection (opt-in). None keeps every built-in enabled
+        # (default, byte-identical to today); a selection maps the recognized
+        # built-in names onto the `enable_*` flags just constructed above.
+        # Runs BEFORE the disable_kompress override below so that flag stays
+        # authoritative for turning Kompress off.
+        _apply_compressor_selection(router_config, config.compressors)
+        # External (non-built-in) `headroom.compressor` selections are ignored by
+        # `_apply_compressor_selection` (they have no enable_* flag). Thread them
+        # to the router here so it can route matching blocks through them; None
+        # (no external selected) keeps the external-dispatch branch inert.
+        router_config.active_external_compressors = _external_compressor_selection(
+            config.compressors
         )
         # No-CCR lossless mode: compress tool outputs with format-native
         # lossless compaction and marker-free SmartCrusher, and suppress every
@@ -2522,7 +2622,47 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             **details,
         }
 
+    def _kompress_health_routers() -> list[ContentRouter]:
+        routers: list[ContentRouter] = []
+        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+            for transform in getattr(pipeline, "transforms", ()):
+                if (
+                    isinstance(transform, ContentRouter)
+                    and transform.config.enable_kompress
+                    and all(transform is not item for item in routers)
+                ):
+                    routers.append(transform)
+        return routers
+
+    def _reconcile_kompress_health() -> bool:
+        routers = _kompress_health_routers()
+        if not routers:
+            return False
+
+        compressors: list[Any] = []
+        for router in routers:
+            for name in ("_kompress", "_kompress_remote"):
+                compressor = getattr(router, name, None)
+                if compressor is not None and all(compressor is not item for item in compressors):
+                    compressors.append(compressor)
+
+        for compressor in compressors:
+            try:
+                if not compressor.is_ready():
+                    continue
+                backend = compressor.ready_backend()
+                if not backend:
+                    continue
+            except Exception:
+                continue
+            if proxy.warmup.kompress.status == "loaded":
+                return True
+            proxy.warmup.kompress.mark_loaded(handle=compressor, backend=backend)
+            return True
+        return True
+
     def _health_checks() -> dict[str, dict[str, Any]]:
+        kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()
             if proxy.memory_handler
@@ -2569,7 +2709,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 error=_upstream_check_cache["error"],
             ),
             "kompress": _component_health(
-                enabled=not config.disable_kompress,
+                enabled=kompress_enabled,
                 ready=proxy.warmup.kompress.status == "loaded",
                 backend=proxy.warmup.kompress.info.get("backend", None),
             ),
@@ -3889,6 +4029,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             else {},
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
+            "extension_savings": dict(m.extension_savings),
             "codex_ws": {
                 "units_total": m.codex_ws_units_total,
                 "units_modified_total": m.codex_ws_units_modified_total,

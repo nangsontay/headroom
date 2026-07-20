@@ -1177,6 +1177,11 @@ class KompressCompressor(Transform):
         """
         return self.config.model_id in _kompress_cache
 
+    def ready_backend(self) -> str | None:
+        """Return the cached backend without triggering a load."""
+        entry = _kompress_cache.get(self.config.model_id)
+        return entry[2] if entry is not None else None
+
     def ensure_background_load(self) -> None:
         """Kick off a one-shot, non-blocking background download of the model.
 

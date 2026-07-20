@@ -379,7 +379,15 @@ class CCRResponseHandler:
                 "content": response.get("content", []),
             }
         elif provider == "openai":
-            message = response.get("choices", [{}])[0].get("message", {})
+            # Guard an empty/malformed ``choices`` the same way the Google branch
+            # below (and ccr/tool_calls.py) already do: ``response.get("choices",
+            # [{}])`` only falls back when the key is absent, so a present-but-
+            # empty ``choices: []`` (or ``[null]``) — which OpenAI-compatible
+            # gateways can send on a content-filtered/usage-only response — made
+            # ``[0]`` raise IndexError (or ``.get`` raise on a non-dict).
+            choices = response.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else {}
+            message = first.get("message", {}) if isinstance(first, dict) else {}
             return {
                 "role": "assistant",
                 "content": message.get("content"),

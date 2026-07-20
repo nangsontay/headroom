@@ -612,6 +612,34 @@ def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
     )
 
 
+def test_build_copilot_upstream_url_preserves_v1_messages_for_copilot() -> None:
+    # Copilot's Anthropic surface for Claude models is /v1/messages (with the
+    # /v1); stripping it forwarded /messages and Copilot 404'd (#2409).
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://api.githubcopilot.com",
+            "/v1/messages",
+        )
+        == "https://api.githubcopilot.com/v1/messages"
+    )
+    # Batches under the messages endpoint keep /v1 too.
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://api.githubcopilot.com",
+            "/v1/messages/batches",
+        )
+        == "https://api.githubcopilot.com/v1/messages/batches"
+    )
+    # A GHE Copilot host keeps /v1/messages as well.
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://copilot-api.acme.ghe.com",
+            "/v1/messages",
+        )
+        == "https://copilot-api.acme.ghe.com/v1/messages"
+    )
+
+
 def test_build_copilot_upstream_url_strips_v1_for_ghe_copilot_hosts() -> None:
     assert (
         copilot_auth.build_copilot_upstream_url(

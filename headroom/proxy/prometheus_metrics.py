@@ -117,6 +117,13 @@ class PrometheusMetrics:
         self.compressions_by_strategy: dict[str, int] = defaultdict(int)
         self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
 
+        # Per-extension token savings, keyed by the extension-supplied
+        # ``key``. Populated lazily by ``record_extension_savings`` — no
+        # hardcoded list of extensions. Proxy extensions report the tokens
+        # they saved so per-extension contribution is observable via /stats,
+        # mirroring the per-strategy compression breakdown above.
+        self.extension_savings: dict[str, int] = defaultdict(int)
+
         # Fail-open compression failures, keyed by reason ("timeout",
         # "error"). The proxy fails open on any optimization error so the
         # request still succeeds; without this counter the failure is only
@@ -321,6 +328,7 @@ class PrometheusMetrics:
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
+            self.extension_savings.clear()
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
                 self.kompress_size_gate_by_outcome.clear()
@@ -482,6 +490,24 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+    def record_extension_savings(self, key: str, saved: int) -> None:
+        """Accumulate tokens saved by a proxy extension, keyed by ``key``.
+
+        Called by proxy extensions that perform their own token
+        reduction and want that contribution surfaced alongside the
+        built-in compression metrics. The per-extension totals are
+        exposed via /stats (``extension_savings``), mirroring how
+        ``record_compression`` accumulates ``tokens_saved_by_strategy``.
+
+        Synchronous + lock-free: ``defaultdict(int)`` writes are atomic
+        under the GIL for these key types, matching ``record_compression``.
+
+        Non-positive ``saved`` values are ignored — the metric never
+        records "negative savings".
+        """
+        if saved > 0:
+            self.extension_savings[key] += saved
 
     def record_compression_failed(self, reason: str) -> None:
         """Record one fail-open compression failure, bucketed by ``reason``.
