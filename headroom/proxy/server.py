@@ -4117,6 +4117,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "original_tokens_cached": compression_stats.get("total_original_tokens", 0),
                 "compressed_tokens_cached": compression_stats.get("total_compressed_tokens", 0),
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
+                # CCR retrieval drawback -> net savings. Mirrored from the session
+                # summary (single source of the net computation) so external
+                # dashboards can read net without descending into `summary`.
+                "tokens_retrieved": summary["compression"].get("tokens_retrieved", 0),
+                "retrievals_total": summary["compression"].get("retrievals_total", 0),
+                "net_tokens_saved": summary["compression"].get("net_tokens_saved", 0),
+                "retrieval_cost_usd": summary["cost"].get("retrieval_cost_usd", 0.0),
             },
             "compression_cache": compression_cache_stats,
             # Always False: the anonymous telemetry beacon was removed, so no
@@ -4143,6 +4150,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     for p in feedback_stats.get("tool_patterns", {}).values()
                     if p.get("retrieval_rate", 0) > 0.3
                 ),
+                # Over-compression signal: tools the model keeps re-expanding.
+                # Surfaced as a ranked list (top 5) for the dashboard CCR card.
+                "high_retrieval_tools": sorted(
+                    (
+                        {
+                            "tool": name,
+                            "retrieval_rate": round(p.get("retrieval_rate", 0), 4),
+                            "retrievals": p.get("retrievals", 0),
+                            "compressions": p.get("compressions", 0),
+                        }
+                        for name, p in feedback_stats.get("tool_patterns", {}).items()
+                        if p.get("retrieval_rate", 0) > 0.3
+                    ),
+                    key=lambda r: r["retrieval_rate"],
+                    reverse=True,
+                )[:5],
             },
             "toin": get_toin().get_stats(),
             "context_tool": {

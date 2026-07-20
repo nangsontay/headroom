@@ -58,6 +58,7 @@ class CCRToolResult:
     content: str
     success: bool
     items_retrieved: int = 0
+    tokens_retrieved: int = 0
 
 
 @dataclass
@@ -111,6 +112,9 @@ class CCRResponseHandler:
     def __init__(self, config: ResponseHandlerConfig | None = None):
         self.config = config or ResponseHandlerConfig()
         self._retrieval_count = 0
+        self._retrieved_tokens = 0
+        self._ccr_overhead_input_tokens = 0
+        self._ccr_overhead_output_tokens = 0
         self._retrieval_count_lock = __import__("threading").Lock()
 
     def has_ccr_tool_calls(
@@ -229,6 +233,9 @@ class CCRResponseHandler:
                     content=content,
                     success=True,
                     items_retrieved=entry.original_item_count,
+                    tokens_retrieved=(
+                        getattr(entry, "original_tokens", 0) or len(entry.original_content) // 4
+                    ),
                 )
 
             miss_status = (
@@ -475,9 +482,6 @@ class CCRResponseHandler:
                 break
 
             rounds += 1
-            with self._retrieval_count_lock:
-                self._retrieval_count += len(ccr_calls)
-
             logger.info(f"CCR: Handling {len(ccr_calls)} retrieval(s) in round {rounds}")
 
             # Execute all CCR retrievals
@@ -514,6 +518,23 @@ class CCRResponseHandler:
             else:
                 current_messages.append(tool_result_msg)
 
+            # Account this round atomically so get_stats sees a consistent
+            # snapshot: retrieval count, the retrieved payload, and the usage of
+            # the response we are about to drop (its tool_use output plus the
+            # continuation's input are real billed tokens the round adds).
+            _in_tok, _out_tok = self._extract_usage_tokens(current_response)
+            with self._retrieval_count_lock:
+                self._retrieval_count += len(ccr_calls)
+                self._retrieved_tokens += sum(r.tokens_retrieved for r in results)
+                self._ccr_overhead_input_tokens += _in_tok
+                self._ccr_overhead_output_tokens += _out_tok
+
+            # Durable ledger: record this round's proxy-side retrieval so
+            # `headroom savings` reflects net (not just gross) for proxy
+            # deployments -- the proxy CCR handler never routes through the MCP
+            # tool path that writes the ledger. Best-effort, blended-rate priced.
+            self._record_retrieval_savings(results)
+
             # Make continuation API call
             try:
                 current_response = await api_call_fn(current_messages, tools)
@@ -531,15 +552,66 @@ class CCRResponseHandler:
 
         return current_response
 
+    def _record_retrieval_savings(self, results: list[CCRToolResult]) -> None:
+        """Append a durable retrieve event for a proxy CCR round (best-effort).
+
+        The proxy's in-process handler never routes through the MCP tool path
+        that writes the ledger, so without this `headroom savings` would show
+        gross (not net) for proxy deployments. Priced at the blended rate
+        (the handler has no request-model context). Never raises.
+        """
+        try:
+            successes = [r for r in results if r.success and r.tokens_retrieved > 0]
+            payload = sum(r.tokens_retrieved for r in successes)
+            if payload <= 0:
+                return
+            from headroom import savings_ledger
+            from headroom.ccr import CCR_RETRIEVAL_OVERHEAD_TOKENS
+
+            savings_ledger.record_savings_event(
+                tokens_before=0,
+                tokens_after=0,
+                kind="retrieve",
+                tokens_retrieved=payload + len(successes) * CCR_RETRIEVAL_OVERHEAD_TOKENS,
+                model=None,
+                client="proxy",
+                source="proxy",
+            )
+        except Exception:
+            logger.debug("durable proxy retrieval recording failed", exc_info=True)
+
+    @staticmethod
+    def _extract_usage_tokens(resp: Any) -> tuple[int, int]:
+        """Return (input_tokens, output_tokens) from a provider response.
+
+        Tolerates Anthropic (input_tokens/output_tokens) and OpenAI
+        (prompt_tokens/completion_tokens) shapes; (0, 0) when absent.
+        """
+        if not isinstance(resp, dict):
+            return 0, 0
+        usage = resp.get("usage") or {}
+        if not isinstance(usage, dict):
+            return 0, 0
+        inp = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        out = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        try:
+            return int(inp), int(out)
+        except (TypeError, ValueError):
+            return 0, 0
+
     def get_stats(self) -> dict[str, Any]:
         """Get handler statistics."""
-        return {
-            "total_retrievals": self._retrieval_count,
-            "config": {
-                "enabled": self.config.enabled,
-                "max_rounds": self.config.max_retrieval_rounds,
-            },
-        }
+        with self._retrieval_count_lock:
+            return {
+                "total_retrievals": self._retrieval_count,
+                "tokens_retrieved": self._retrieved_tokens,
+                "ccr_overhead_input_tokens": self._ccr_overhead_input_tokens,
+                "ccr_overhead_output_tokens": self._ccr_overhead_output_tokens,
+                "config": {
+                    "enabled": self.config.enabled,
+                    "max_rounds": self.config.max_retrieval_rounds,
+                },
+            }
 
 
 @dataclass

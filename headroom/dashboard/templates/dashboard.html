@@ -285,6 +285,50 @@
                             </div>
                         </div>
                     </template>
+
+                    <!-- CCR Retrievals: net impact of retrieval-augmented compression (savings minus retrieval drawback) -->
+                    <template x-if="hasCcrRetrievals">
+                        <div data-testid="ccr-retrieval-card" class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="flex items-center justify-between mb-2">
+                                <div class="text-xs text-gray-500 uppercase tracking-wide">CCR Retrievals <span class="normal-case text-gray-600">· net (session)</span></div>
+                                <div class="rounded-full border bg-black/20 px-3 py-1 text-[11px] uppercase tracking-[0.18em]" :class="ccrNetTokensSaved >= 0 ? 'border-emerald-400/20 text-emerald-300/90' : 'border-red-400/25 text-red-300/90'" x-text="ccrNetTokensSaved >= 0 ? 'Net positive' : 'Net negative'"></div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-2">
+                                <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-gray-500">Retrievals</div>
+                                    <div class="mt-1 text-xl font-light tabular-nums" x-text="formatNumber(stats.summary?.compression?.retrievals_total || 0)"></div>
+                                </div>
+                                <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-gray-500">Retrieval Rate</div>
+                                    <div class="mt-1 text-xl font-light tabular-nums" x-text="(ccrRetrievalRate * 100).toFixed(1) + '%'"></div>
+                                </div>
+                                <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-gray-500">Tokens Retrieved</div>
+                                    <div class="mt-1 text-xl font-light tabular-nums" x-text="formatNumber(stats.summary?.compression?.tokens_retrieved || 0)"></div>
+                                </div>
+                                <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
+                                    <div class="text-[11px] uppercase tracking-[0.18em] text-gray-500">Retrieval Cost</div>
+                                    <div class="mt-1 text-xl font-light tabular-nums" x-text="'$' + formatCurrency(stats.summary?.cost?.retrieval_cost_usd || 0)"></div>
+                                </div>
+                            </div>
+                            <div class="rounded-2xl border border-white/8 bg-black/20 p-4 mt-2">
+                                <div class="text-[11px] uppercase tracking-[0.18em] text-gray-500">Net Tokens Saved</div>
+                                <div data-testid="ccr-net-tokens" class="mt-1 text-xl font-light tabular-nums" :class="ccrNetTokensSaved >= 0 ? 'text-emerald-400' : 'text-red-400'" x-text="(ccrNetTokensSaved >= 0 ? '+' : '-') + formatNumber(Math.abs(ccrNetTokensSaved))"></div>
+                                <div class="mt-1 text-[11px] text-gray-600">savings minus retrieval drawback</div>
+                            </div>
+                            <template x-if="stats.feedback_loop?.high_retrieval_tools?.length">
+                                <div class="mt-2 pt-2 border-t border-border">
+                                    <div class="text-[11px] text-gray-600 mb-1">High-Retrieval Tools</div>
+                                    <template x-for="tool in stats.feedback_loop.high_retrieval_tools" :key="tool.tool">
+                                        <div class="flex justify-between text-xs text-gray-500">
+                                            <span x-text="tool.tool"></span>
+                                            <span :class="tool.retrieval_rate >= 0.5 ? 'text-red-400' : 'text-amber-400'" x-text="(tool.retrieval_rate * 100).toFixed(1) + '%'"></span>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+                    </template>
                 </div>
 
                 <!-- Performance -->
@@ -1293,7 +1337,7 @@
                 </div>
 
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-3">
-                    <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Tokens</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Input</dt><dd x-text="formatNumber(lifetimeStats.tokens?.input || 0)"></dd></div><div class="flex justify-between"><dt>Output</dt><dd x-text="formatNumber(lifetimeStats.tokens?.output || 0)"></dd></div><div class="flex justify-between"><dt>Attempted Input</dt><dd x-text="formatNumber(lifetimeStats.tokens?.attempted_input || 0)"></dd></div><div class="flex justify-between"><dt>Saved</dt><dd class="text-emerald-400" x-text="formatNumber(lifetimeStats.tokens?.saved || 0)"></dd></div><div class="flex justify-between"><dt>Token Savings</dt><dd x-text="lifetimeStats.tokens?.token_savings_percent == null ? '—' : lifetimeStats.tokens.token_savings_percent.toFixed(1) + '%'"></dd></div></dl></section>
+                    <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Tokens</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Input</dt><dd x-text="formatNumber(lifetimeStats.tokens?.input || 0)"></dd></div><div class="flex justify-between"><dt>Output</dt><dd x-text="formatNumber(lifetimeStats.tokens?.output || 0)"></dd></div><div class="flex justify-between"><dt>Attempted Input</dt><dd x-text="formatNumber(lifetimeStats.tokens?.attempted_input || 0)"></dd></div><div class="flex justify-between"><dt>Saved <span class="text-gray-600">(gross)</span></dt><dd class="text-emerald-400" x-text="formatNumber(lifetimeStats.tokens?.saved || 0)"></dd></div><div class="flex justify-between"><dt>Token Savings</dt><dd x-text="lifetimeStats.tokens?.token_savings_percent == null ? '—' : lifetimeStats.tokens.token_savings_percent.toFixed(1) + '%'"></dd></div></dl></section>
                     <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Cost</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Input cost</dt><dd x-text="'$' + formatCurrency(lifetimeStats.cost?.input_usd || 0)"></dd></div><div class="flex justify-between"><dt>Compression saved</dt><dd class="text-emerald-400" x-text="'$' + formatCurrency(lifetimeStats.cost?.compression_savings_usd || 0)"></dd></div><div class="flex justify-between"><dt>Prefix Cache saved</dt><dd class="text-cyan-400" x-text="'$' + formatCurrency(lifetimeStats.cost?.cache_savings_usd || 0)"></dd></div></dl></section>
                     <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Prefix Cache</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Hits / requests</dt><dd x-text="formatNumber(lifetimeStats.prefix_cache?.hit_requests || 0) + ' / ' + formatNumber(lifetimeStats.prefix_cache?.requests || 0)"></dd></div><div class="flex justify-between"><dt>Hit rate</dt><dd x-text="lifetimeStats.prefix_cache?.cache_hit_rate == null ? '—' : lifetimeStats.prefix_cache.cache_hit_rate.toFixed(1) + '%'"></dd></div><div class="flex justify-between"><dt>Read / write</dt><dd x-text="formatNumber(lifetimeStats.prefix_cache?.cache_read_tokens || 0) + ' / ' + formatNumber(lifetimeStats.prefix_cache?.cache_write_tokens || 0)"></dd></div><div class="flex justify-between"><dt>TTL 1h / 5m</dt><dd x-text="(lifetimeStats.prefix_cache?.ttl_1h_percent == null ? '—' : lifetimeStats.prefix_cache.ttl_1h_percent.toFixed(0) + '%') + ' / ' + (lifetimeStats.prefix_cache?.ttl_5m_percent == null ? '—' : lifetimeStats.prefix_cache.ttl_5m_percent.toFixed(0) + '%')"></dd></div><div class="flex justify-between"><dt>Cache bust</dt><dd x-text="formatNumber(lifetimeStats.prefix_cache?.bust_count || 0) + ' / ' + formatNumber(lifetimeStats.prefix_cache?.bust_tokens || 0)"></dd></div></dl></section>
                 </div>
@@ -2529,6 +2573,19 @@
                         || (cvc.tokens_lost_to_cache_bust || 0) > 0
                         || (pf.tokens_preserved || 0) > 0
                         || (pf.compression_foregone_tokens || 0) > 0;
+                },
+
+                get ccrRetrievalRate() {
+                    return this.stats.feedback_loop?.global_retrieval_rate ?? this.stats.telemetry?.global_retrieval_rate ?? 0;
+                },
+
+                get ccrNetTokensSaved() {
+                    const c = this.stats.summary?.compression || {};
+                    return c.net_tokens_saved ?? ((c.total_tokens_removed || 0) - (c.tokens_retrieved || 0));
+                },
+
+                get hasCcrRetrievals() {
+                    return (this.stats.summary?.compression?.retrievals_total || 0) > 0;
                 },
 
                 // --- Cache miss attribution (#1313) ---
