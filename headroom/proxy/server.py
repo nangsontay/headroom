@@ -1969,7 +1969,18 @@ class HeadroomProxy(
         """
         from headroom.proxy.outcome import emit_request_outcome
 
-        await emit_request_outcome(self, outcome)
+        # Shielded because four call sites are `finally:` blocks inside streaming
+        # async generators (streaming.py:1611, :1859, :2069, openai.py:8614). A
+        # client disconnect cancels that task, and the funnel now suspends partway
+        # through: `record_request` commits the Prometheus counters, then awaits
+        # the ledger append in a worker thread. A cancellation landing on that
+        # await leaves the request counted in Prometheus but missing from the cost
+        # tracker, the request log, and the PERF line `headroom perf` reads.
+        #
+        # The shield does not swallow the cancellation — the await below still
+        # raises CancelledError, so generator teardown propagates exactly as
+        # before. It only keeps the bookkeeping from being torn in half.
+        await asyncio.shield(emit_request_outcome(self, outcome))
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""

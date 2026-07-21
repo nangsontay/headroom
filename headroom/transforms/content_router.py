@@ -78,6 +78,7 @@ from .content_detector import (
 )
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
+from .lossless_provider import get_lossless_provider
 from .mixed_content import ContentSection, mixed_content_indicators
 from .relevance_split import build_relevance_query, plan_relevance_split
 
@@ -5195,7 +5196,20 @@ class ContentRouter(Transform):
         Always safe to run (information-preserving) so there is no feature gate.
         Never raises.
         """
-        if not isinstance(content, str) or len(content) < 200:
+        if not isinstance(content, str):
+            return None
+        provider = get_lossless_provider()
+        if provider is not None:
+            try:
+                # A registered provider is authoritative for excluded-tool
+                # compaction; fall back to the built-in folds only if it raises.
+                return provider(content)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "lossless provider failed; using built-in compaction",
+                    exc_info=True,
+                )
+        if len(content) < 200:
             return None
         try:
             from .lossless_compaction import compact_lossless
