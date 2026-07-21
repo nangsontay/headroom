@@ -321,6 +321,14 @@
                                 <div data-testid="ccr-net-tokens" class="mt-1 text-xl font-light tabular-nums" :class="ccrNetTokensSaved >= 0 ? 'text-emerald-400' : 'text-red-400'" x-text="(ccrNetTokensSaved >= 0 ? '+' : '-') + formatNumber(Math.abs(ccrNetTokensSaved))"></div>
                                 <div class="mt-1 text-[11px] text-gray-600">savings minus retrieval drawback</div>
                             </div>
+                            <!-- Retrievals recorded by prior proxy processes (durable ledger; survives restart) -->
+                            <template x-if="lifetimeRetrievals > 0">
+                                <div class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 mt-2">
+                                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Retrievals (lifetime)</div>
+                                    <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="formatNumber(lifetimeRetrievals)"></div>
+                                    <div class="text-xs" :class="lifetimeNetTokensSaved >= 0 ? 'text-emerald-400/70' : 'text-red-400/80'" x-text="formatNumber(lifetimeTokensRetrieved) + ' retrieved-back \u00b7 net ' + (lifetimeNetTokensSaved >= 0 ? '+' : '') + formatNumber(lifetimeNetTokensSaved)"></div>
+                                </div>
+                            </template>
                             <template x-if="stats.feedback_loop?.high_retrieval_tools?.length">
                                 <div class="mt-2 pt-2 border-t border-border">
                                     <div class="text-[11px] text-gray-600 mb-1">High-Retrieval Tools</div>
@@ -2610,8 +2618,21 @@
                     return c.net_tokens_saved ?? ((c.total_tokens_removed || 0) - (c.tokens_retrieved || 0));
                 },
 
+                get lifetimeRetrievals() {
+                    return this.stats.persistent_savings?.lifetime?.retrievals || 0;
+                },
+
+                get lifetimeTokensRetrieved() {
+                    return this.stats.persistent_savings?.lifetime?.tokens_retrieved || 0;
+                },
+
+                get lifetimeNetTokensSaved() {
+                    return this.stats.persistent_savings?.lifetime?.net_tokens_saved || 0;
+                },
+
                 get hasCcrRetrievals() {
-                    return (this.stats.summary?.compression?.retrievals_total || 0) > 0;
+                    return (this.stats.summary?.compression?.retrievals_total || 0) > 0
+                        || this.lifetimeRetrievals > 0;
                 },
 
                 // --- Cache miss attribution (#1313) ---

@@ -3794,6 +3794,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         cache_net_usd = prefix_cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
         total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
+        # Durable CCR retrieval figures (survive proxy restart). The session
+        # CCR card only reflects the current process's in-memory handler counts,
+        # so retrievals recorded by prior proxy processes vanish after a restart.
+        # Surface the ledger's lifetime totals next to lifetime cache reads. Copy
+        # the lifetime dict before augmenting so the tracker snapshot is untouched.
+        # Best-effort -- never break /stats on a ledger read.
+        try:
+            from headroom.savings_ledger import aggregate_savings
+
+            _ledger_lifetime = aggregate_savings().lifetime
+            _ps_lifetime = dict(persistent_savings.get("lifetime") or {})
+            _ps_lifetime["retrievals"] = int(_ledger_lifetime.get("retrievals", 0) or 0)
+            _ps_lifetime["tokens_retrieved"] = int(
+                _ledger_lifetime.get("tokens_retrieved", 0) or 0
+            )
+            _ps_lifetime["net_tokens_saved"] = int(
+                _ledger_lifetime.get("net_tokens_saved", 0) or 0
+            )
+            persistent_savings["lifetime"] = _ps_lifetime
+        except Exception:  # noqa: BLE001 -- never break /stats on a ledger read
+            pass
         display_session = persistent_savings.get("display_session", {})
         recent_request_logs = proxy.logger.get_recent(10_000) if proxy.logger else []
         recent_request_payload = _build_recent_request_payload()
