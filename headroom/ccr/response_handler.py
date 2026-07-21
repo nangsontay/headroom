@@ -518,11 +518,24 @@ class CCRResponseHandler:
             else:
                 current_messages.append(tool_result_msg)
 
+            # Capture the usage of the response we are about to drop. Only
+            # account the retrieved payload after the continuation succeeds; if
+            # that upstream call fails, the payload was never re-injected into a
+            # billed request.
+            _in_tok, _out_tok = self._extract_usage_tokens(current_response)
+
+            # Make continuation API call
+            try:
+                next_response = await api_call_fn(current_messages, tools)
+            except Exception as e:
+                logger.error(f"CCR: Continuation API call failed: {e}")
+                # Return the response we had (with unhandled CCR calls)
+                # The client will see the tool_use and might handle it differently
+                break
+
             # Account this round atomically so get_stats sees a consistent
             # snapshot: retrieval count, the retrieved payload, and the usage of
-            # the response we are about to drop (its tool_use output plus the
-            # continuation's input are real billed tokens the round adds).
-            _in_tok, _out_tok = self._extract_usage_tokens(current_response)
+            # the dropped tool_use response.
             with self._retrieval_count_lock:
                 self._retrieval_count += len(ccr_calls)
                 self._retrieved_tokens += sum(r.tokens_retrieved for r in results)
@@ -534,15 +547,7 @@ class CCRResponseHandler:
             # deployments -- the proxy CCR handler never routes through the MCP
             # tool path that writes the ledger. Best-effort, blended-rate priced.
             self._record_retrieval_savings(results)
-
-            # Make continuation API call
-            try:
-                current_response = await api_call_fn(current_messages, tools)
-            except Exception as e:
-                logger.error(f"CCR: Continuation API call failed: {e}")
-                # Return the response we had (with unhandled CCR calls)
-                # The client will see the tool_use and might handle it differently
-                break
+            current_response = next_response
 
         if rounds >= self.config.max_retrieval_rounds:
             logger.warning(

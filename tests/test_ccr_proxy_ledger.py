@@ -87,3 +87,33 @@ def test_proxy_ccr_miss_writes_no_ledger_event(monkeypatch, tmp_path):
         )
     )
     assert not ledger.exists() or ledger.read_text(encoding="utf-8") == ""
+
+
+def test_proxy_ccr_continuation_failure_writes_no_retrieve_event(monkeypatch, tmp_path):
+    ledger = tmp_path / "savings_events.jsonl"
+    monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(ledger))
+
+    handler = CCRResponseHandler()
+    monkeypatch.setattr(
+        handler,
+        "_execute_retrieval",
+        lambda call: CCRToolResult(
+            tool_call_id=call.tool_call_id, content="{}", success=True, tokens_retrieved=800
+        ),
+    )
+
+    async def failing_continuation(messages, tools):
+        raise RuntimeError("upstream failed")
+
+    asyncio.run(
+        handler.handle_response(
+            _tool_use_response({"input_tokens": 1200, "output_tokens": 40}),
+            [{"role": "user", "content": "hi"}],
+            [],
+            failing_continuation,
+            "anthropic",
+        )
+    )
+
+    assert handler.get_stats()["tokens_retrieved"] == 0
+    assert not ledger.exists() or ledger.read_text(encoding="utf-8") == ""
