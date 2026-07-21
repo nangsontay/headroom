@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from headroom.tokenizers.base import BaseTokenizer
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -12,7 +13,7 @@ from headroom.transforms.content_router import (
 )
 
 
-class _Tokenizer:
+class _Tokenizer(BaseTokenizer):
     def count_text(self, content: str) -> int:
         return len(content.split())
 

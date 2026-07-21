@@ -4,7 +4,7 @@ A full-featured LLM proxy with optimization, caching, rate limiting,
 and observability.
 
 Features:
-- Context optimization (SmartCrusher, CacheAligner — live-zone-only after Phase B)
+- Context optimization (ContentRouter/SmartCrusher — live-zone-only after Phase B)
 - Semantic caching (save costs on repeated queries)
 - Rate limiting (token bucket)
 - Retry with exponential backoff
@@ -46,6 +46,7 @@ from urllib.parse import urlsplit
 if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
+    from ..cache.token_count_memo import TokenCountMemo
     from ..memory.tracker import MemoryTracker
     from .outcome import RequestOutcome
 
@@ -81,7 +82,6 @@ from headroom.ccr import (
 )
 from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
-    CacheAlignerConfig,
     ReadLifecycleConfig,
 )
 from headroom.dashboard import get_dashboard_html
@@ -183,7 +183,6 @@ from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
-    CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
     CompressionStrategy,
@@ -934,7 +933,6 @@ class HeadroomProxy(
                 return router_config
             return replace(router_config, enable_kompress=not kompress_disabled)
 
-        cache_aligner = CacheAligner(CacheAlignerConfig(enabled=False))
         anthropic_router = ContentRouter(
             _router_config_for(anthropic_kompress_disabled), observer=self.metrics
         )
@@ -946,17 +944,22 @@ class HeadroomProxy(
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
         _intercept_prefix: list = []
-        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+        if os.environ.get("HEADROOM_INTERCEPT_ENABLED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             _intercept_prefix = [ToolResultInterceptorTransform()]
 
         self.anthropic_pipeline = TransformPipeline(
-            transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
+            transforms=[*_intercept_prefix, anthropic_router],
             provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=[*_intercept_prefix, cache_aligner, openai_router],
+            transforms=[*_intercept_prefix, openai_router],
             provider=self.openai_provider,
         )
 
@@ -997,10 +1000,16 @@ class HeadroomProxy(
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
         # `CompressionCache` instances have their own internal lock guarding
-        # `_cache`/`_stable_hashes`/`_first_seen` against concurrent
+        # `_cache`/`_stable_hashes` against concurrent
         # async-dispatched requests for the same session.
         self._compression_caches: dict[str, CompressionCache] = {}
         self._compression_caches_lock = threading.RLock()
+
+        # Per-session memoized message token counts (perf review F2). Same
+        # session-scoped-dict + eviction pattern as `_compression_caches`;
+        # each `TokenCountMemo` has its own internal lock guarding `_counts`.
+        self._token_count_memos: dict[str, TokenCountMemo] = {}
+        self._token_count_memos_lock = threading.RLock()
 
         self.logger = (
             RequestLogger(
@@ -1537,6 +1546,30 @@ class HeadroomProxy(
 
                 self._compression_caches[session_id] = CompressionCache()
             return self._compression_caches[session_id]
+
+    def _get_token_count_memo(self, session_id: str) -> TokenCountMemo:
+        """Get or create a TokenCountMemo for a session (perf review F2).
+
+        Same thread-safety and eviction contract as `_get_compression_cache`.
+        """
+        with self._token_count_memos_lock:
+            if session_id not in self._token_count_memos:
+                from headroom.cache.token_count_memo import TokenCountMemo
+
+                if len(self._token_count_memos) >= MAX_COMPRESSION_CACHE_SESSIONS:
+                    oldest_keys = list(self._token_count_memos.keys())[
+                        : MAX_COMPRESSION_CACHE_SESSIONS // 4
+                    ]
+                    for key in oldest_keys:
+                        del self._token_count_memos[key]
+                    logger.info(
+                        "Evicted %d token-count memos (exceeded %d max sessions)",
+                        len(oldest_keys),
+                        MAX_COMPRESSION_CACHE_SESSIONS,
+                    )
+
+                self._token_count_memos[session_id] = TokenCountMemo()
+            return self._token_count_memos[session_id]
 
     def _setup_code_aware(self, config: ProxyConfig, transforms: list) -> str:
         """Set up code-aware compression if enabled.
@@ -2359,12 +2392,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
-    # (which already applies them before Click parsing). setdefault keeps
-    # explicit env exports authoritative; fail-open so it never blocks startup.
+    # (which already applies them before Click parsing). settings.json wins over
+    # a shell-exported env var here — highest priority below an explicit CLI arg;
+    # manifest_managed knobs keep the export. Fail-open so it never blocks startup.
     try:
         from headroom import settings_store
 
-        settings_store.apply_to_environ(settings_store.load())
+        stored = settings_store.load()
+        settings_store.apply_to_environ(stored)
+        # Live (Output Shaping) knobs are intentionally NOT written to os.environ
+        # (that would env-lock them in the GUI). Seed them into the hot-reload
+        # override store so persisted values stay active after a restart yet
+        # remain editable. The override wins over os.environ, so the stored
+        # value takes precedence over a shell export, matching settings-first.
+        _live_seed = settings_store.runtime_overrides(
+            settings_store.live_keys(list(stored)), stored
+        )
+        runtime_env.set_overrides(_live_seed)
     except Exception:  # noqa: BLE001 — settings load must never break startup
         pass
 
@@ -3331,6 +3375,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             schema["supervised"] = mode != "foreground"
         except Exception:  # noqa: BLE001 — schema must render even if detection fails
             schema["supervised"] = False
+        # Live (runtime_env) knobs apply without a restart, so their true current
+        # value is the hot-reload override — not the launch-time environ the store
+        # read. Reflect that so the form shows what is actually active right now.
+        for field_schema in schema["fields"]:
+            if field_schema.get("live"):
+                field_schema["value"] = settings_store.coerce_env_value(
+                    field_schema["key"], runtime_env.getenv(field_schema["env"])
+                )
+        schema["values"] = {f["key"]: f["value"] for f in schema["fields"]}
         return JSONResponse(status_code=200, content=schema)
 
     @app.get("/settings", dependencies=[Depends(_require_loopback)])
@@ -3371,6 +3424,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
         after = settings_store.load()
         changed_keys = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        # Live (Output Shaping) knobs hot-reload with no restart: push their new
+        # values to the runtime-env override store so they take effect on the
+        # next request. Every other knob is startup-captured and needs a restart.
+        live_changed = settings_store.live_keys(changed_keys)
+        if live_changed:
+            runtime_env.set_overrides(settings_store.runtime_overrides(live_changed, after))
+            # A live knob cleared to its default is absent from `after`; drop its
+            # override so the reader falls back to the adaptive default right away.
+            for key in live_changed:
+                if key not in after:
+                    env = settings_store.env_for(key)
+                    if env:
+                        runtime_env.clear_override(env)
+        restart_changed = [k for k in changed_keys if k not in live_changed]
         record_admin_action(
             request=request,
             action="settings_update",
@@ -3379,7 +3446,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         return JSONResponse(
             status_code=200,
-            content={"ok": True, "needs_restart": bool(changed_keys), "changed_keys": changed_keys},
+            content={
+                "ok": True,
+                "needs_restart": bool(restart_changed),
+                "changed_keys": changed_keys,
+                "live_keys": live_changed,
+            },
         )
 
     @app.post(

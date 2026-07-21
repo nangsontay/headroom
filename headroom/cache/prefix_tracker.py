@@ -359,6 +359,33 @@ def overlay_cached_prefix(
     return list(prev_fwd[:k]) + list(optimized_messages[k:])
 
 
+def is_append_only_extension(
+    current_original_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+) -> bool:
+    """Return True iff ``previous_original_messages`` is a full canonical
+    prefix of ``current_original_messages``.
+
+    This is the same append-only condition ``overlay_cached_prefix`` requires
+    before it will replay ANY previously-forwarded content — a position is
+    only guaranteed to hold last turn's cached bytes when this holds for the
+    ENTIRE previous message list, not just a leading run of it. Used by
+    handler-level injection guards to detect "this exact tail position was
+    already forwarded last turn" without duplicating the canonicalization
+    logic.
+    """
+    if not previous_original_messages:
+        return False
+    n = len(previous_original_messages)
+    if len(current_original_messages) < n:
+        return False
+    return all(
+        _canonicalize_for_prefix_compare(current_original_messages[i])
+        == _canonicalize_for_prefix_compare(previous_original_messages[i])
+        for i in range(n)
+    )
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -504,6 +531,14 @@ class PrefixCacheTracker:
         """
         self._last_activity = time.time()
         self._turn_number += 1
+        if original_messages is None:
+            logger.warning(
+                "PrefixCacheTracker[%s]: update_from_response called without "
+                "original_messages — falling back to forwarded messages as "
+                "originals, which busts the overlay's append-only cache-safety "
+                "check on the next turn.",
+                self.provider,
+            )
         self._last_original_messages = copy.deepcopy(original_messages or messages)
         self._last_forwarded_messages = copy.deepcopy(messages)
 
@@ -546,10 +581,12 @@ class PrefixCacheTracker:
         )
 
     def get_last_original_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_original_messages)
+        """Returns internal state — treat as immutable; do not mutate messages or blocks."""
+        return self._last_original_messages
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
-        return copy.deepcopy(self._last_forwarded_messages)
+        """Returns internal state — treat as immutable; do not mutate messages or blocks."""
+        return self._last_forwarded_messages
 
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""
@@ -664,30 +701,6 @@ class PrefixCacheTracker:
         self._busts_avoided += 1
         self._tokens_preserved += tokens_preserved
         self._compression_foregone_tokens += compression_foregone
-
-    def should_force_compress(
-        self,
-        message_index: int,
-        message_tokens: int,
-        estimated_compressed_tokens: int,
-    ) -> bool:
-        """Check if compression savings outweigh cache preservation.
-
-        Returns True if we should bust the cache and compress anyway.
-        This happens when compression would save a large fraction of tokens
-        AND the savings exceed the cache read discount.
-        """
-        if message_index >= self._cached_message_count:
-            return True  # Not in frozen prefix, always compress
-
-        if message_tokens == 0:
-            return False
-
-        savings_fraction = (message_tokens - estimated_compressed_tokens) / message_tokens
-
-        # Would compression savings exceed the cache read discount?
-        read_discount = _PROVIDER_READ_DISCOUNT.get(self.provider, 0.5)
-        return savings_fraction > read_discount
 
     @property
     def is_expired(self) -> bool:
