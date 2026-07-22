@@ -68,8 +68,79 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             _strip_index_from_content_blocks(block.get("content"))
 
 
+def _append_ccr_instructions_to_system(body: dict[str, Any]) -> bool:
+    """Append stable CCR retrieval instructions to an Anthropic body."""
+    from headroom.ccr.tool_injection import create_stable_system_instructions
+
+    marker = "Compressed Context Available"
+    instructions = create_stable_system_instructions().strip()
+    system = body.get("system")
+
+    if isinstance(system, str):
+        if marker in system:
+            return False
+        body["system"] = f"{system}\n\n{instructions}" if system else instructions
+        return True
+
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and marker in str(block.get("text", "")):
+                return False
+            if isinstance(block, str) and marker in block:
+                return False
+        system.append({"type": "text", "text": instructions})
+        return True
+
+    body["system"] = instructions
+    return True
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
+
+    def _start_waste_signal_task(
+        self,
+        result,  # noqa: ANN001
+        *,
+        model: str,
+        provider_name: str,
+    ):  # noqa: ANN201
+        provider = getattr(result, "waste_signals_provider", None)
+        if provider is None:
+            return None
+
+        def _job() -> dict[str, int] | None:
+            try:
+                from headroom.observability import get_otel_metrics
+
+                waste_signals = provider()
+                if waste_signals is None:
+                    return None
+                signals_dict = waste_signals.to_dict()
+                get_otel_metrics().record_waste_signals(
+                    model=model,
+                    provider=provider_name,
+                    waste_signals=signals_dict,
+                )
+                return signals_dict
+            except Exception:
+                logger.debug("Background waste-signal detection failed", exc_info=True)
+                return None
+
+        task = asyncio.create_task(self._run_compression_background(_job))
+        tasks = getattr(self, "_waste_signal_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._waste_signal_tasks = tasks
+
+        def _on_done(t) -> None:  # noqa: ANN001
+            tasks.discard(t)
+            if not t.cancelled():
+                t.exception()
+
+        tasks.add(task)
+        task.add_done_callback(_on_done)
+        return task
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         """Resolve a tokenizer and count messages off the event loop.
@@ -1810,12 +1881,6 @@ class AnthropicHandlerMixin:
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
-                if inject_system_instructions and frozen_message_count > 0:
-                    logger.info(
-                        f"[{request_id}] CCR: skipping system instruction injection "
-                        f"(frozen prefix={frozen_message_count}) to preserve cache"
-                    )
-                    inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
                 if configured_inject_tool and frozen_message_count > 0:
                     logger.info(
@@ -1827,11 +1892,12 @@ class AnthropicHandlerMixin:
                 injector = CCRToolInjector(
                     provider="anthropic",
                     inject_tool=False,  # routed through sticky helper below
-                    inject_system_instructions=inject_system_instructions,
+                    inject_system_instructions=False,
                 )
                 injector.scan_for_markers(optimized_messages)
                 if inject_system_instructions and injector.has_compressed_content:
-                    optimized_messages = injector.inject_into_system_message(optimized_messages)
+                    if _append_ccr_instructions_to_system(body):
+                        body_mutation_tracker.mark_mutated("ccr_system_instructions")
 
                 # Sticky-on tool registration (PR-B7): always inject the
                 # retrieval tool once a session has done CCR, regardless
@@ -3274,12 +3340,14 @@ class AnthropicHandlerMixin:
                                 await self.metrics.record_cache_bust(bust_tokens)
 
                         # Update prefix cache tracker for next turn
-                        next_original_messages = copy.deepcopy(original_client_messages)
-                        next_forwarded_messages = copy.deepcopy(optimized_messages)
+                        # Shallow outer-list copies only: update_from_response()
+                        # makes the single defensive deepcopy at record time.
+                        next_original_messages = list(original_client_messages)
+                        next_forwarded_messages = list(optimized_messages)
                         assistant_message = self._assistant_message_from_response_json(resp_json)
                         if assistant_message is not None:
-                            next_original_messages.append(copy.deepcopy(assistant_message))
-                            next_forwarded_messages.append(copy.deepcopy(assistant_message))
+                            next_original_messages.append(assistant_message)
+                            next_forwarded_messages.append(assistant_message)
 
                         # Cache-miss attribution (#1313): when this turn expected a
                         # prompt-cache hit but got cr_tokens == 0, decide whether the
