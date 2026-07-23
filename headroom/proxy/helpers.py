@@ -77,6 +77,9 @@ from headroom.proxy.ccr_marker_policy import (
 from headroom.proxy.ccr_marker_policy import (
     should_inject_ccr_tool as _should_inject_ccr_tool,
 )
+from headroom.proxy.ccr_marker_policy import (
+    transcript_references_ccr_tool as transcript_references_ccr_tool,  # noqa: F401 - compatibility export
+)
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
 from headroom.proxy.ccr_session_tracker import (
     SessionExpansionDedupTracker as _SessionExpansionDedupTracker,
@@ -2324,6 +2327,7 @@ def should_inject_ccr_tool(
     configured_inject_tool: bool,
     frozen_message_count: int,
     has_compressed_content: bool,
+    transcript_requires_tool: bool = False,
 ) -> tuple[bool, bool]:
     """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
 
@@ -2337,6 +2341,11 @@ def should_inject_ccr_tool(
     that case we override the deferral and inject anyway (one cache miss is
     cheaper than dropped content).
 
+    ``transcript_requires_tool`` similarly overrides the deferral when the
+    transcript still carries a dangling ``headroom_retrieve`` reference but the
+    sticky tracker state was lost (a ``/model`` switch or proxy restart) — the
+    reference would otherwise 400.
+
     Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
     True only when injection happens *because* of new markers despite a deferral,
     so the caller can log the override distinctly.
@@ -2345,6 +2354,7 @@ def should_inject_ccr_tool(
         configured_inject_tool=configured_inject_tool,
         frozen_message_count=frozen_message_count,
         has_compressed_content=has_compressed_content,
+        transcript_requires_tool=transcript_requires_tool,
     )
 
 
@@ -2355,6 +2365,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    transcript_requires_tool: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2365,13 +2376,16 @@ def apply_session_sticky_ccr_tool(
     Logic:
 
       * If ``session_id`` is None: tracker is bypassed and the per-turn
-        ``has_compressed_content_this_turn`` flag drives the decision
-        verbatim (matching legacy behaviour for WS / pre-session paths).
+        ``has_compressed_content_this_turn`` flag (or ``transcript_requires_tool``)
+        drives the decision verbatim (matching legacy behaviour for WS paths).
       * If the session has previously done CCR (``has_done_ccr``):
         ALWAYS inject the recorded golden bytes — even if this turn has
         no fresh compression. That is the load-bearing PR-B7 fix.
-      * Otherwise, inject only when this turn produced compressed content.
-        The first injection records the golden bytes for future turns.
+      * Otherwise, inject when this turn produced compressed content OR
+        ``transcript_requires_tool`` is set (the transcript still names the tool
+        but tracker state was lost — a ``/model`` switch or restart). The first
+        injection records the golden bytes so subsequent turns resume the normal
+        sticky-replay path.
 
     Tools whose name already equals ``CCR_TOOL_NAME`` (e.g. the client
     pre-registered it via MCP) are not re-appended; the client's bytes
@@ -2405,7 +2419,7 @@ def apply_session_sticky_ccr_tool(
 
     # No session_id (e.g. WS path): per-turn decision drives directly.
     if not session_id:
-        if not has_compressed_content_this_turn:
+        if not has_compressed_content_this_turn and not transcript_requires_tool:
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2419,7 +2433,11 @@ def apply_session_sticky_ccr_tool(
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
-            decision="inject_first_time",
+            decision=(
+                "inject_transcript_recovery"
+                if transcript_requires_tool and not has_compressed_content_this_turn
+                else "inject_first_time"
+            ),
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -2469,8 +2487,10 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, True
 
-    # Fresh session — only inject when this turn produced compressed content.
-    if not has_compressed_content_this_turn:
+    # Fresh session — inject when this turn produced compressed content, or when
+    # the transcript still references the tool but tracker state was lost
+    # (transcript recovery: a /model switch or proxy restart).
+    if not has_compressed_content_this_turn and not transcript_requires_tool:
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2486,7 +2506,11 @@ def apply_session_sticky_ccr_tool(
     log_tool_injection_decision(
         provider=provider,
         session_id=session_id,
-        decision="inject_first_time",
+        decision=(
+            "inject_transcript_recovery"
+            if transcript_requires_tool and not has_compressed_content_this_turn
+            else "inject_first_time"
+        ),
         tool_definition_bytes_count=len(replay.canonical_bytes),
         request_id=request_id,
     )

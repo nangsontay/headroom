@@ -213,6 +213,33 @@ See [issue #746](https://github.com/headroomlabs-ai/headroom/issues/746) for the
   deployment. See [issue #2028](https://github.com/headroomlabs-ai/headroom/issues/2028).
 </Callout>
 
+## `Tool reference 'headroom_retrieve' not found` after a `/model` switch
+
+**Symptom**: Through the proxy, switching models mid-session (`/model` in Claude Code) —
+or restarting the proxy — makes every subsequent turn fail with:
+
+```
+400 Tool reference 'headroom_retrieve' not found in available tools
+```
+
+**Cause**: Once a session has done CCR compression, the proxy registers the
+`headroom_retrieve` retrieval tool and the client transcript starts carrying a
+`tool_reference` block naming it. Anthropic validates every `tool_reference` in the
+messages against the request's `tools` array. The proxy's sticky guarantee that keeps
+re-injecting the tool was keyed by a **model-scoped, in-memory** session id, so a
+`/model` switch (or a proxy restart) rotated/lost that key — the tool stopped being
+injected while the transcript kept re-sending the reference, leaving it dangling.
+
+**Fix**: Upgrade to a build that self-heals this. The proxy now scans the
+about-to-forward transcript for a dangling `headroom_retrieve` `tool_reference`/`tool_use`
+and re-injects the tool independent of tracker state, so `/model` switches and restarts
+recover automatically (logged as `decision=inject_transcript_recovery`).
+
+**Workarounds on older versions**:
+
+- `/model` back to the model you started the session on, or
+- `/clear` to start a fresh session (drops the dangling reference).
+
 ## Remote Control unavailable through custom ANTHROPIC_BASE_URL
 
 **Symptom**: When Claude Code runs with `ANTHROPIC_BASE_URL` set to a custom host (for example, Headroom), the Remote Control menu is absent.

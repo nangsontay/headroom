@@ -1947,6 +1947,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.helpers import (
                     has_new_ccr_markers,
                     should_inject_ccr_tool,
+                    transcript_references_ccr_tool,
                 )
 
                 # #1850: only markers NEW this turn justify overriding the
@@ -1961,10 +1962,22 @@ class AnthropicHandlerMixin:
                     provider="anthropic",
                 )
 
+                # Self-heal a dangling headroom_retrieve reference: a /model
+                # switch or proxy restart rotates the model-scoped sticky key,
+                # so the tracker stops injecting while the client transcript
+                # still carries a tool_reference/tool_use naming the tool.
+                # Anthropic 400s every such turn. Scanning the about-to-forward
+                # transcript recovers injection independent of tracker state.
+                transcript_requires_tool = transcript_references_ccr_tool(
+                    optimized_messages,
+                    provider="anthropic",
+                )
+
                 should_inject, is_marker_override = should_inject_ccr_tool(
                     configured_inject_tool=configured_inject_tool,
                     frozen_message_count=frozen_message_count,
                     has_compressed_content=has_new_compressed_content,
+                    transcript_requires_tool=transcript_requires_tool,
                 )
                 if should_inject:
                     if is_marker_override:
@@ -1974,6 +1987,13 @@ class AnthropicHandlerMixin:
                             f"(frozen_message_count={frozen_message_count}); injecting to "
                             "prevent unredeemable markers (#1006)"
                         )
+                    elif transcript_requires_tool:
+                        logger.info(
+                            f"[{request_id}] CCR: recovering headroom_retrieve from "
+                            "transcript — a dangling tool_reference exists but sticky "
+                            "tracker state was lost (/model switch or restart); "
+                            "re-injecting to avoid a 400"
+                        )
                     from headroom.proxy.helpers import apply_session_sticky_ccr_tool
 
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
@@ -1982,6 +2002,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=has_new_compressed_content,
+                        transcript_requires_tool=transcript_requires_tool,
                     )
                     if ccr_tool_injected:
                         logger.debug(

@@ -373,3 +373,224 @@ def test_ccrtoolinjector_session_has_done_ccr_kwarg():
     tools, was = injector.inject_tool_definition(None, session_has_done_ccr=True)
     assert was is True
     assert _has_ccr_tool(tools)
+
+
+# ─── Transcript-scan recovery (dangling tool_reference after /model switch) ──
+# Covers headroom/proxy/ccr_marker_policy.transcript_references_ccr_tool plus the
+# transcript_requires_tool wiring through apply_session_sticky_ccr_tool. Regression
+# guard for the 400 "Tool reference 'headroom_retrieve' not found in available tools".
+
+from headroom.proxy.helpers import (  # noqa: E402
+    should_inject_ccr_tool,
+    transcript_references_ccr_tool,
+)
+
+
+def _anthropic_tool_reference_msg(name=CCR_TOOL_NAME):
+    return {"role": "user", "content": [{"type": "tool_reference", "name": name}]}
+
+
+def _anthropic_tool_use_msg(name=CCR_TOOL_NAME):
+    return {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "looking that up"},
+            {"type": "tool_use", "id": "toolu_1", "name": name, "input": {"hash": "abc"}},
+        ],
+    }
+
+
+def _openai_tool_call_msg(name=CCR_TOOL_NAME):
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": name, "arguments": "{}"}}
+        ],
+    }
+
+
+# --- policy: transcript_references_ccr_tool ---------------------------------
+
+
+def test_transcript_ref_matches_anthropic_tool_reference():
+    assert transcript_references_ccr_tool([_anthropic_tool_reference_msg()]) is True
+
+
+def test_transcript_ref_matches_anthropic_tool_use():
+    assert transcript_references_ccr_tool([_anthropic_tool_use_msg()]) is True
+
+
+def test_transcript_ref_matches_nested_one_level():
+    """tool_search_tool_result / tool_result nest the reference one level down."""
+    msg = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_9",
+                "content": [{"type": "tool_reference", "name": CCR_TOOL_NAME}],
+            }
+        ],
+    }
+    assert transcript_references_ccr_tool([msg]) is True
+
+
+def test_transcript_ref_ignores_mcp_prefixed_name():
+    """Client-owned mcp__headroom__headroom_retrieve must NOT trigger injection."""
+    ref = _anthropic_tool_reference_msg(name="mcp__headroom__headroom_retrieve")
+    use = _anthropic_tool_use_msg(name="mcp__headroom__headroom_retrieve")
+    assert transcript_references_ccr_tool([ref, use]) is False
+
+
+def test_transcript_ref_tolerates_string_and_malformed_content():
+    messages = [
+        {"role": "user", "content": "plain string content"},
+        {"role": "assistant", "content": [None, "loose text", {"type": "text"}]},
+        "not-a-dict",
+        {"no_content_key": True},
+    ]
+    assert transcript_references_ccr_tool(messages) is False
+
+
+def test_transcript_ref_empty_and_none():
+    assert transcript_references_ccr_tool(None) is False
+    assert transcript_references_ccr_tool([]) is False
+
+
+def test_transcript_ref_matches_openai_tool_calls():
+    assert transcript_references_ccr_tool([_openai_tool_call_msg()], provider="openai") is True
+
+
+def test_transcript_ref_openai_ignores_mcp_prefixed_name():
+    msg = _openai_tool_call_msg(name="mcp__headroom__headroom_retrieve")
+    assert transcript_references_ccr_tool([msg], provider="openai") is False
+
+
+# --- policy: should_inject_ccr_tool transcript override ---------------------
+
+
+def test_should_inject_transcript_override_beats_frozen_deferral():
+    """Frozen prefix defers config injection; a dangling reference overrides it."""
+    should_inject, is_marker_override = should_inject_ccr_tool(
+        configured_inject_tool=True,
+        frozen_message_count=5,
+        has_compressed_content=False,
+        transcript_requires_tool=True,
+    )
+    assert should_inject is True
+    # is_marker_override stays specific to fresh #1006 markers, not this path.
+    assert is_marker_override is False
+
+
+def test_should_inject_no_transcript_no_markers_stays_deferred():
+    should_inject, is_marker_override = should_inject_ccr_tool(
+        configured_inject_tool=True,
+        frozen_message_count=5,
+        has_compressed_content=False,
+        transcript_requires_tool=False,
+    )
+    assert should_inject is False
+    assert is_marker_override is False
+
+
+# --- integration: apply_session_sticky_ccr_tool transcript recovery ---------
+
+
+def test_transcript_recovery_injects_on_fresh_tracker(caplog):
+    """/model-switch shape: dangling ref, fresh tracker, no fresh markers → inject."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        tools, injected = apply_session_sticky_ccr_tool(
+            provider="anthropic",
+            session_id="rotated-session-key",
+            request_id="rec-1",
+            existing_tools=[],
+            has_compressed_content_this_turn=False,
+            transcript_requires_tool=True,
+        )
+    assert injected is True
+    assert _has_ccr_tool(tools)
+    assert "inject_transcript_recovery" in caplog.text
+
+
+def test_transcript_recovery_records_sticky_state():
+    """After recovery injects, the next turn replays without needing the flag."""
+    session_id = "recovery-then-sticky"
+    _tools1, injected1 = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=session_id,
+        request_id="rec-a",
+        existing_tools=[],
+        has_compressed_content_this_turn=False,
+        transcript_requires_tool=True,
+    )
+    assert injected1 is True
+
+    # Subsequent turn: no dangling ref, no fresh markers — sticky replay covers it.
+    tools2, injected2 = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=session_id,
+        request_id="rec-b",
+        existing_tools=[],
+        has_compressed_content_this_turn=False,
+        transcript_requires_tool=False,
+    )
+    assert injected2 is True
+    assert _has_ccr_tool(tools2)
+
+
+def test_transcript_recovery_no_session_id_path():
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id=None,
+        request_id="rec-ws",
+        existing_tools=[],
+        has_compressed_content_this_turn=False,
+        transcript_requires_tool=True,
+    )
+    assert injected is True
+    assert _has_ccr_tool(tools)
+
+
+def test_reference_free_request_unchanged():
+    """No dangling ref + fresh tracker + no markers → still no injection."""
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id="fresh-no-ref",
+        request_id="rec-none",
+        existing_tools=[],
+        has_compressed_content_this_turn=False,
+        transcript_requires_tool=False,
+    )
+    assert injected is False
+    assert not _has_ccr_tool(tools)
+
+
+def test_transcript_recovery_skips_when_client_already_has_tool():
+    """Client already provides the tool — no dangling ref, so do not double up."""
+    client_tool = {"name": CCR_TOOL_NAME, "input_schema": {"type": "object"}}
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="anthropic",
+        session_id="client-owned",
+        request_id="rec-dup",
+        existing_tools=[client_tool],
+        has_compressed_content_this_turn=False,
+        transcript_requires_tool=True,
+    )
+    assert injected is False
+    assert len(tools) == 1
+
+
+def test_transcript_recovery_openai_chat_shape():
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="openai",
+        session_id="openai-rotated",
+        request_id="rec-oai",
+        existing_tools=[],
+        has_compressed_content_this_turn=False,
+        transcript_requires_tool=True,
+    )
+    assert injected is True
+    assert _has_ccr_tool(tools)

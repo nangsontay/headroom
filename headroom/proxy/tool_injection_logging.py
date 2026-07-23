@@ -8,6 +8,7 @@ from typing import Literal
 ToolInjectionDecision = Literal[
     "inject_first_time",
     "inject_sticky_replay",
+    "inject_transcript_recovery",
     "skip",
     "skip_disabled_via_env",
 ]

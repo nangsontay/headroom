@@ -3230,6 +3230,7 @@ class OpenAIHandlerMixin:
                 from headroom.proxy.helpers import (
                     apply_session_sticky_ccr_tool,
                     has_new_ccr_markers,
+                    transcript_references_ccr_tool,
                 )
 
                 # #1850: markers replayed from overlay_cached_prefix are
@@ -3242,12 +3243,23 @@ class OpenAIHandlerMixin:
                     previous_forwarded_messages=openai_prefix_tracker.get_last_forwarded_messages(),
                     provider="openai",
                 )
+
+                # Self-heal a dangling headroom_retrieve reference after tracker
+                # state loss (proxy restart): the chat history still carries a
+                # prior headroom_retrieve tool call in assistant.tool_calls.
+                # OpenAI does not hard-400 on this the way Anthropic does, but
+                # re-injecting restores marker redeemability regardless.
+                transcript_requires_tool = transcript_references_ccr_tool(
+                    optimized_messages,
+                    provider="openai",
+                )
                 tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                     provider="openai",
                     session_id=openai_session_id,
                     request_id=request_id,
                     existing_tools=tools,
                     has_compressed_content_this_turn=has_new_compressed_content,
+                    transcript_requires_tool=transcript_requires_tool,
                 )
                 if ccr_tool_injected:
                     logger.debug(
