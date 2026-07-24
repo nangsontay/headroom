@@ -411,6 +411,22 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         if _proactive_rec is not None:
             _proactive_rec(*_pending_proactive)
 
+    # Deferred waste-signal collection: the task was started right after the
+    # pipeline ran, so by the time the upstream response arrives it has
+    # usually long finished. Collection is strictly opportunistic — this
+    # funnel is awaited BEFORE the response is returned on the non-streaming
+    # path, so it must never wait on the single-worker background executor
+    # (which can be busy for seconds with a deferred compression job). If the
+    # task isn't done yet, only this request's per-row attribution is lost
+    # (telemetry-only, fail open); the task keeps running and still records
+    # its OTel counter.
+    waste_signals = outcome.waste_signals
+    task = outcome.waste_signals_task
+    if waste_signals is None and task is not None and task.done():
+        try:
+            waste_signals = task.result()
+        except Exception:
+            waste_signals = None
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
     # observed output tokens to the recorder so it can produce an honest
@@ -444,7 +460,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
         pipeline_timing=outcome.pipeline_timing,
-        waste_signals=outcome.waste_signals,
+        waste_signals=waste_signals,
         cache_read_tokens=outcome.cache_read_tokens,
         cache_write_tokens=outcome.cache_write_tokens,
         cache_write_5m_tokens=outcome.cache_write_5m_tokens,
@@ -502,7 +518,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 cache_write_tokens=outcome.cache_write_tokens,
                 uncached_input_tokens=outcome.uncached_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
-                waste_signals=outcome.waste_signals,
+                waste_signals=waste_signals,
                 request_messages=outcome.request_messages,
                 compressed_messages=outcome.compressed_messages,
                 turn_id=outcome.turn_id,
