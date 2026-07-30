@@ -525,13 +525,6 @@
                                 <div class="text-xs text-gray-500" x-show="!cacheSessionActive">no activity since restart</div>
                             </div>
                         </div>
-                        <template x-if="lifetimeCacheReadTokens > 0 || lifetimeCacheSavingsUsd > 0">
-                            <div class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 mb-4">
-                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cache Reads (lifetime)</div>
-                                <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="formatNumber(lifetimeCacheReadTokens)"></div>
-                                <div class="text-xs text-emerald-400/70" x-text="'$' + formatCurrency(lifetimeCacheSavingsUsd) + ' saved'"></div>
-                            </div>
-                        </template>
                         <!-- Cache efficiency bar (session-scoped; hidden until traffic arrives) -->
                         <div x-show="cacheSessionActive">
                             <div class="flex justify-between text-xs text-gray-500 mb-1">
