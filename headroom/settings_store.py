@@ -830,6 +830,29 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Replace a large tool list with a single search tool to cut tool-schema tokens.",
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_COLD_RECOMPACT",
+        "cold_recompact",
+        "Cold-prefix recompaction",
+        "Compression",
+        "bool",
+        default=False,
+        help="Recompact the whole history when the provider prompt cache has lapsed. Fires only "
+        "on a confirmed-cold turn, so there is no warm cache to bust.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_NET_COST_POLICY",
+        "net_cost_policy",
+        "Net-cost frozen-floor unlock",
+        "Compression",
+        "bool",
+        default=False,
+        help="Allow compression to rewrite messages already inside the provider's cached prefix "
+        "when the token saving beats the cache-rewrite penalty. Without it, savings stop growing "
+        "once the prefix goes warm.",
+        tier="advanced",
+    ),
     # CCR & Caching page
     SettingField(
         "HEADROOM_CCR_BACKEND",

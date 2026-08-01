@@ -213,6 +213,34 @@ class TestProxyModeKnob:
             settings_store.save({"mode": "turbo"})
 
 
+class TestPrefixCacheUnlockKnobs:
+    """Both knobs govern whether a warm provider prefix may be recompressed."""
+
+    @pytest.mark.parametrize(
+        ("key", "env"),
+        [
+            ("cold_recompact", "HEADROOM_COLD_RECOMPACT"),
+            ("net_cost_policy", "HEADROOM_NET_COST_POLICY"),
+        ],
+    )
+    def test_advanced_compression_bool_defaulting_off(self, key, env):
+        field = settings_store._BY_KEY[key]
+        assert field.env == env
+        assert field.type == "bool"
+        assert field.default is False
+        assert field.page == "Compression"
+        assert field.tier == "advanced"
+        assert field.live is False
+
+    @pytest.mark.parametrize("key", ["cold_recompact", "net_cost_policy"])
+    def test_enabling_serializes_to_one(self, workspace, key):
+        # Both readers gate on the literal "1": content_router compares
+        # `== "1"`, the cold-prefix hook accepts "1"/"true"/"yes".
+        settings_store.save({key: True})
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ[settings_store.env_for(key)] == "1"
+
+
 class TestCliArgToggles:
     def test_positive_toggles_default_enabled(self):
         for key in ("optimize", "cache_enabled", "rate_limit_enabled"):

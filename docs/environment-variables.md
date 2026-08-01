@@ -250,6 +250,8 @@ selection* for the `HEADROOM_KOMPRESS_BACKEND` value table (`auto`, `onnx`,
 | `HEADROOM_COMPRESS_WORKERS` | Worker count for the content-router compression pool. |
 | `HEADROOM_BACKGROUND_COMPRESSION` / `HEADROOM_BACKGROUND_COMPRESSION_MIN_TOKENS` | Enable/threshold for async background (post-response) compression. |
 | `HEADROOM_DEDUPE` | Enable cross-turn duplicate-content dedup. |
+| `HEADROOM_COLD_RECOMPACT` | Recompact the whole prefix when the provider prompt cache has lapsed (confirmed-cold turns only, so nothing warm is busted). |
+| `HEADROOM_NET_COST_POLICY` | `1` unlocks the frozen floor: messages already inside the provider's cached prefix may be rewritten when the token saving beats the cache-rewrite penalty. Without it, savings stop growing once the prefix goes warm. |
 | `HEADROOM_TOOL_SEARCH` | Enable tool-search injection (replace large tool lists with a search tool). |
 | `HEADROOM_PIPELINE_BREAKER_THRESHOLD` / `HEADROOM_PIPELINE_BREAKER_COOLDOWN_S` | Circuit-breaker: consecutive transform failures before tripping, and cooldown before retry. |
 | `HEADROOM_PREFER_CODE_AWARE_FOR_CODE` | Prefer AST code-aware compression over Kompress for detected code content. |
@@ -349,7 +351,6 @@ keys and header maps stay env-only and are never exposed in the GUI.
 | `HEADROOM_PERIODIC_TOIN_STATS` | Enable periodic TOIN stats logging (default on; set `0` to disable). |
 | `HEADROOM_NET_COST_CACHE_TTL_SECONDS` | Cache TTL for the net-cost (savings-vs-overhead) estimator. |
 | `HEADROOM_NET_COST_EXPECTED_READS` | Expected-reads parameter feeding the net-cost model. |
-| `HEADROOM_NET_COST_POLICY` | Net-cost evaluation policy selection. |
 | `HEADROOM_NET_COST_P_ALIVE` | Probability-of-reuse parameter for the net-cost model. |
 
 ### Anonymous usage beacon
