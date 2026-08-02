@@ -56,6 +56,35 @@ def consume_pending_proactive_retrieval() -> tuple[int, int] | None:
     return value
 
 
+# CCR reactive-continuation overhead (the dropped rounds' real billed usage),
+# bound per-request via a ContextVar for the same reason as the proactive one:
+# the outcome funnel can fold it into the billed token totals WITHOUT threading
+# a parameter through every handler. handle_response publishes the per-call sum
+# (kept in locals, so it is safe across concurrent requests on a shared handler);
+# consumed only in emit's success section, so a failed forward books nothing.
+# The payload is cache-split (uncached_input, cache_read, cache_write, output) so
+# cost_with_headroom prices continuation cache at the right rate rather than
+# folding cached tokens into uncached input at full list price.
+_pending_ccr_continuation_usage: ContextVar[tuple[int, int, int, int] | None] = ContextVar(
+    "headroom_ccr_continuation_pending", default=None
+)
+
+
+def set_pending_ccr_continuation_usage(
+    value: tuple[int, int, int, int] | None,
+) -> None:
+    """Bind the dropped continuation rounds' (uncached_in, cache_read, cache_write, output) to this request."""
+    _pending_ccr_continuation_usage.set(value)
+
+
+def consume_pending_ccr_continuation_usage() -> tuple[int, int, int, int] | None:
+    """Read and clear the pending continuation usage for this request."""
+    value = _pending_ccr_continuation_usage.get()
+    if value is not None:
+        _pending_ccr_continuation_usage.set(None)
+    return value
+
+
 @dataclass(frozen=True)
 class RequestOutcome:
     """Immutable, value-equal snapshot of a completed request.
@@ -362,6 +391,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     and is awaitable-compatible. We could lift this to a typing.Protocol
     if/when another contract surface emerges, but YAGNI.
     """
+    import dataclasses
+
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
@@ -385,6 +416,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # >=500 short-circuit must never book a retrieval that was never billed.
     _pending_proactive = consume_pending_proactive_retrieval()
 
+    # Consume (read + clear) the dropped CCR continuation rounds' usage for this
+    # request. Folded into the billed totals only in the success section below —
+    # a >=500 short-circuit must never book continuation tokens that, by the
+    # account-after-success rule in handle_response, were never billed.
+    _pending_continuation = consume_pending_ccr_continuation_usage()
+
     # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
     # exhaustion) must not feed the savings/cost/log success stats; that would
     # let a failed request inflate the save-rate. Record it as failed and stop,
@@ -402,6 +439,25 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         _proactive_rec = getattr(handler, "_record_proactive_retrieval_drawback", None)
         if _proactive_rec is not None:
             _proactive_rec(*_pending_proactive)
+
+    # Fold the dropped continuation rounds' real billed usage into the cost-
+    # relevant token totals. handle_response returns only the final round, so
+    # without this the intermediate rounds' usage never reaches cost_with_headroom
+    # (it sat in the /stats ccr_overhead side-channel but was deliberately
+    # excluded from the total). Each bucket lands in the field cost_with_headroom
+    # prices: uncached input at list, cache_read at the discounted rate,
+    # cache_write at the premium rate, and output into the budget/metrics total
+    # (cost_with_headroom itself is input-only). Client-facing response.usage is
+    # unchanged; only the internal billed totals move.
+    if _pending_continuation is not None:
+        _ct_uin, _ct_cr, _ct_cw, _ct_out = _pending_continuation
+        outcome = dataclasses.replace(
+            outcome,
+            output_tokens=outcome.output_tokens + _ct_out,
+            uncached_input_tokens=outcome.uncached_input_tokens + _ct_uin,
+            cache_read_tokens=outcome.cache_read_tokens + _ct_cr,
+            cache_write_tokens=outcome.cache_write_tokens + _ct_cw,
+        )
 
     # Output-shaping savings ledger (counterfactual estimator). The shaper
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the

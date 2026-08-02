@@ -459,6 +459,19 @@ class CCRResponseHandler:
         current_response = response
         current_messages = list(messages)  # Copy to avoid mutation
         rounds = 0
+        # Per-call sum of the dropped rounds' usage, split into the cost buckets
+        # the outcome funnel prices (uncached input / cache_read / cache_write /
+        # output). Kept in locals (NOT the shared instance counters at 542-543)
+        # so concurrent requests on one handler can't mix their overhead; the
+        # instance counters stay for the /stats ccr_overhead attribution view.
+        # Cache-split (not just gross input) matters: OpenAI prompt_tokens and
+        # Anthropic input_tokens have different cache semantics, and pricing
+        # cached tokens at the discounted/premium rate vs full-list uncached is
+        # the difference between an accurate fold and an over-count.
+        call_overhead_uncached_in = 0
+        call_overhead_cache_read = 0
+        call_overhead_cache_write = 0
+        call_overhead_output = 0
 
         while rounds < self.config.max_retrieval_rounds:
             # Check for CCR tool calls
@@ -541,6 +554,11 @@ class CCRResponseHandler:
                 self._retrieved_tokens += sum(r.tokens_retrieved for r in results)
                 self._ccr_overhead_input_tokens += _in_tok
                 self._ccr_overhead_output_tokens += _out_tok
+                _uin, _cr, _cw, _uout = self._extract_round_cost_usage(current_response, provider)
+                call_overhead_uncached_in += _uin
+                call_overhead_cache_read += _cr
+                call_overhead_cache_write += _cw
+                call_overhead_output += _uout
 
             # Durable ledger: record this round's proxy-side retrieval so
             # `headroom savings` reflects net (not just gross) for proxy
@@ -553,6 +571,28 @@ class CCRResponseHandler:
             logger.warning(
                 f"CCR: Hit max retrieval rounds ({self.config.max_retrieval_rounds}), "
                 f"returning response with possible unhandled CCR calls"
+            )
+
+        # Publish this call's dropped-round usage (cache-split) to the outcome
+        # funnel (per-asyncio-task ContextVar). The funnel folds each bucket
+        # into the matching cost field so cost_with_headroom prices continuation
+        # cache at the right rate. Guarded so a no-continuation call (rounds ==
+        # 0) publishes nothing.
+        if (
+            call_overhead_uncached_in
+            or call_overhead_cache_read
+            or call_overhead_cache_write
+            or call_overhead_output
+        ):
+            from headroom.proxy.outcome import set_pending_ccr_continuation_usage
+
+            set_pending_ccr_continuation_usage(
+                (
+                    call_overhead_uncached_in,
+                    call_overhead_cache_read,
+                    call_overhead_cache_write,
+                    call_overhead_output,
+                )
             )
 
         return current_response
@@ -615,6 +655,59 @@ class CCRResponseHandler:
             return int(inp), int(out)
         except (TypeError, ValueError):
             return 0, 0
+
+    @staticmethod
+    def _extract_round_cost_usage(resp: Any, provider: str) -> tuple[int, int, int, int]:
+        """Return (uncached_input, cache_read, cache_write, output) for one
+        continuation round, split into the cost buckets the outcome funnel
+        prices.
+
+        Provider-aware so cached tokens land in cache_read / cache_write
+        (priced discounted / premium by cost_with_headroom) instead of being
+        collapsed into uncached input at full list price. Mirrors the per-handler
+        usage parsing (handlers/anthropic.py, handlers/openai.py) for the dropped
+        continuation rounds, which those handlers only parse for the final round.
+
+        OpenAI cache_write *inference* (_infer_openai_cache_write_tokens) is
+        deliberately NOT replicated here: it is a heuristic, and for the cost
+        fold we only credit cache_write that the provider reported explicitly
+        (cache_creation_input_tokens). Cached-token reads prefer the
+        Anthropic/Bedrock top-level keys when present (authoritative), then fall
+        back to the OpenAI prompt_tokens_details / input_tokens_details shapes.
+        """
+        if not isinstance(resp, dict):
+            return 0, 0, 0, 0
+        usage = resp.get("usage") or {}
+        if not isinstance(usage, dict):
+            return 0, 0, 0, 0
+
+        def _i(value: Any, default: int = 0) -> int:
+            try:
+                return max(int(value), 0)
+            except (TypeError, ValueError):
+                return default
+
+        if provider in ("openai", "openai_responses"):
+            gross = _i(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+            out = _i(usage.get("completion_tokens", usage.get("output_tokens", 0)))
+            cr = _i(usage.get("cache_read_input_tokens", 0))
+            cw = _i(usage.get("cache_creation_input_tokens", 0))
+            if cr == 0:
+                details = (
+                    usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+                )
+                if isinstance(details, dict):
+                    cr = _i(details.get("cached_tokens", 0))
+            uncached = max(0, gross - cr - cw)
+            return uncached, cr, cw, out
+
+        # anthropic (and default): input_tokens is already the uncached portion.
+        return (
+            _i(usage.get("input_tokens", 0)),
+            _i(usage.get("cache_read_input_tokens", 0)),
+            _i(usage.get("cache_creation_input_tokens", 0)),
+            _i(usage.get("output_tokens", 0)),
+        )
 
     def get_stats(self) -> dict[str, Any]:
         """Get handler statistics."""
