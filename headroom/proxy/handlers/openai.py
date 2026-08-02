@@ -5249,6 +5249,24 @@ class OpenAIHandlerMixin:
                                 content=json.dumps(final_resp_json).encode(),
                                 headers=ccr_response_headers,
                             )
+                            # CCR replaced resp_json with the final continuation
+                            # round, so re-derive the usage the outcome funnel
+                            # reads from that final body. Without this the
+                            # outcome carries the initial round's usage (captured
+                            # above, before CCR): it under-counts the final round
+                            # and, combined with the continuation-cost fold,
+                            # double-books the initial round. Absent fields
+                            # default to 0 so a partial final payload cannot
+                            # leave the stale initial usage in place.
+                            _final_usage = resp_json.get("usage") or {}
+                            if isinstance(_final_usage, dict):
+                                total_input_tokens = _usage_int(_final_usage.get("input_tokens"))
+                                output_tokens = _usage_int(_final_usage.get("output_tokens"))
+                                _final_details = _final_usage.get("input_tokens_details") or {}
+                                if isinstance(_final_details, dict):
+                                    cache_read_tokens = _usage_int(
+                                        _final_details.get("cached_tokens")
+                                    )
                             logger.info(
                                 f"[{request_id}] CCR: Retrieval handled successfully (responses)"
                             )
