@@ -65,24 +65,36 @@ def consume_pending_proactive_retrieval() -> tuple[int, int] | None:
 # The payload is cache-split (uncached_input, cache_read, cache_write, output) so
 # cost_with_headroom prices continuation cache at the right rate rather than
 # folding cached tokens into uncached input at full list price.
-_pending_ccr_continuation_usage: ContextVar[tuple[int, int, int, int] | None] = ContextVar(
-    "headroom_ccr_continuation_pending", default=None
-)
+_pending_ccr_continuation_usage: ContextVar[
+    list[tuple[int, int, int, int]] | None
+] = ContextVar("headroom_ccr_continuation_pending", default=None)
 
 
 def set_pending_ccr_continuation_usage(
     value: tuple[int, int, int, int] | None,
 ) -> None:
-    """Bind the dropped continuation rounds' (uncached_in, cache_read, cache_write, output) to this request."""
-    _pending_ccr_continuation_usage.set(value)
+    """Append the dropped continuation rounds' (uncached_in, cache_read, cache_write, output) to this request.
+
+    Additive: each call appends to a list so batch processing (multiple
+    handle_response calls before a single emit) accumulates all items.
+    consume_pending_ccr_continuation_usage sums the list.
+    """
+    if value is None:
+        return
+    items = _pending_ccr_continuation_usage.get()
+    if items is None:
+        items = []
+        _pending_ccr_continuation_usage.set(items)
+    items.append(value)
 
 
 def consume_pending_ccr_continuation_usage() -> tuple[int, int, int, int] | None:
-    """Read and clear the pending continuation usage for this request."""
-    value = _pending_ccr_continuation_usage.get()
-    if value is not None:
-        _pending_ccr_continuation_usage.set(None)
-    return value
+    """Read, sum, and clear all pending continuation usage for this request."""
+    items = _pending_ccr_continuation_usage.get()
+    _pending_ccr_continuation_usage.set(None)
+    if not items:
+        return None
+    return tuple(sum(group) for group in zip(*items))
 
 
 def clear_pending_outcome_side_channels() -> None:

@@ -487,3 +487,48 @@ def test_end_to_end_handle_then_emit_folds_dropped_rounds(monkeypatch):
     assert metrics_rec["uncached_input_tokens"] == U2["input_tokens"]
     assert metrics_rec["cache_read_tokens"] == U2["cache_read_input_tokens"]
     assert metrics_rec["output_tokens"] == U2["output_tokens"]
+
+
+# --- batch path: multiple CCR items accumulate, not overwrite ------------
+
+
+def test_batch_two_ccr_items_both_reach_cost_view():
+    """Two CCR-bearing batch items: both items' continuation overhead
+    reaches cost_tracker.record_tokens, not just the last.
+
+    Simulates BatchResultProcessor: multiple handle_response calls
+    (each set_pending), then one emit_request_outcome (one consume).
+    """
+    handler = _Handler()
+    handler.cost_tracker = _CostTracker()
+    base_out, base_uin, base_cr, base_cw = 800, 110_000, 30_000, 3_000
+    item1 = (205_000, 80_000, 11_000, 1_100)
+    item2 = (100_000, 50_000, 5_000, 500)
+
+    outcome = RequestOutcome(
+        request_id="req-batch", provider="anthropic", model="m", status_code=200,
+        original_tokens=base_uin, optimized_tokens=base_uin, output_tokens=base_out,
+        tokens_saved=0, attempted_input_tokens=base_uin,
+        uncached_input_tokens=base_uin, cache_read_tokens=base_cr, cache_write_tokens=base_cw,
+    )
+
+    async def main():
+        consume_pending_ccr_continuation_usage()
+        set_pending_ccr_continuation_usage(item1)
+        set_pending_ccr_continuation_usage(item2)
+        await emit_request_outcome(handler, outcome)
+        return consume_pending_ccr_continuation_usage()
+
+    leftover = asyncio.run(main())
+
+    assert handler.cost_tracker.recorded, "cost_tracker.record_tokens was not called"
+    ct = handler.cost_tracker.recorded[0]
+    # Both items accumulated into cost_tracker, not just the last
+    assert ct["uncached_tokens"] == base_uin + item1[0] + item2[0]
+    assert ct["cache_read_tokens"] == base_cr + item1[1] + item2[1]
+    assert ct["cache_write_tokens"] == base_cw + item1[2] + item2[2]
+    assert ct["output_tokens"] == base_out + item1[3] + item2[3]
+    # record_request stays on base outcome (cost-only fold)
+    assert handler.metrics.requested[0]["uncached_input_tokens"] == base_uin
+    # Consume cleared after emit
+    assert leftover is None
