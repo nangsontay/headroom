@@ -483,6 +483,183 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         assert sent["messages"][2]["content"].endswith("MEMCTX")
 
 
+@pytest.mark.parametrize(
+    ("frozen_count", "pinned_level", "expect_tail"),
+    [
+        # Established prefix built WITHOUT the tail → skip, preserve cache.
+        (1, None, False),
+        # Fresh conversation → shape from turn 1 and pin the level.
+        (0, None, True),
+        # Conversation already shaped → keep shaping (dropping the tail
+        # would bust the prefix from the other direction).
+        (1, 2, True),
+    ],
+)
+def test_output_shaper_respects_established_frozen_prefix(
+    monkeypatch, frozen_count: int, pinned_level: int | None, expect_tail: bool
+) -> None:
+    from headroom.proxy import runtime_env
+    from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
+
+    runtime_env.clear_overrides()
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        fake_tracker = _FakePrefixTracker(frozen_count=frozen_count)
+        fake_tracker.output_shaping_level = pinned_level
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages, **_kwargs: "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_shape_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "system": "base system",
+                "messages": [
+                    {"role": "user", "content": "frozen prefix"},
+                    {"role": "assistant", "content": "ack"},
+                    {"role": "user", "content": "latest user"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        sent = captured["body"]
+        if expect_tail:
+            assert STEERING_SENTINEL in str(sent["system"])
+            assert fake_tracker.output_shaping_level == 2
+        else:
+            assert sent["system"] == "base system"
+            assert fake_tracker.output_shaping_level is None
+
+
+def test_output_shaper_pins_the_level_the_frozen_prefix_was_built_at(monkeypatch) -> None:
+    """A live verbosity change must not rewrite an established prefix's tail.
+
+    ``HEADROOM_VERBOSITY_LEVEL`` is hot-reloadable, and the learned profile is
+    re-read every request, so the resolved level can move mid-conversation. The
+    steering tail is part of the cached prefix, so once the prefix is frozen the
+    handler has to replay the level it was built at — level 0 (no tail at all)
+    included, which is why the pin is ``int | None`` rather than a boolean.
+    """
+    from headroom.proxy import runtime_env
+    from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
+
+    runtime_env.clear_overrides()
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "0")
+
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages, **_kwargs: "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_shape_2",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        def _post() -> None:
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "system": "base system",
+                    "messages": [
+                        {"role": "user", "content": "frozen prefix"},
+                        {"role": "assistant", "content": "ack"},
+                        {"role": "user", "content": "latest user"},
+                    ],
+                },
+            )
+            assert response.status_code == 200
+
+        # Turn 1: level 0 leaves the system prompt untouched, so this prefix is
+        # established WITHOUT the tail — and pinned at 0, not left unshaped.
+        _post()
+        assert captured["body"]["system"] == "base system"
+        assert fake_tracker.output_shaping_level == 0
+
+        # Turn N: the prefix is frozen and the level has since risen. Appending
+        # the tail now would invalidate the whole prefix.
+        monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+        fake_tracker._frozen_count = 1
+        _post()
+        assert STEERING_SENTINEL not in str(captured["body"]["system"])
+        assert captured["body"]["system"] == "base system"
+        assert fake_tracker.output_shaping_level == 0
+
+        # The mirror image: a prefix established WITH an L2 tail keeps that
+        # exact tail when the live level moves up, down, or away entirely.
+        fake_tracker._frozen_count = 0
+        _post()
+        established = captured["body"]["system"]
+        assert STEERING_SENTINEL in str(established)
+        assert fake_tracker.output_shaping_level == 2
+
+        fake_tracker._frozen_count = 1
+        for drifted in ("3", "0"):
+            monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", drifted)
+            _post()
+            assert captured["body"]["system"] == established
+            assert fake_tracker.output_shaping_level == 2
+
+
 def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
     captured = {"inject_system": None}
     with _make_proxy_client() as client:
