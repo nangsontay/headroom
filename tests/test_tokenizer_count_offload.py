@@ -46,6 +46,20 @@ def _make_proxy():  # noqa: ANN202 — returns the internal HeadroomProxy
     return app.state.proxy
 
 
+def _quarantine_compression(proxy) -> None:  # noqa: ANN001 — internal HeadroomProxy
+    """Put the shared compression executor into the quarantined state.
+
+    Mirrors what a real compression timeout records: the timeout-debt counter
+    *and* the time-cap deadline (#2360). Setting only the counter leaves the
+    deadline at 0.0, which the guard reads as "cap already lapsed, resume
+    compression" — so no quarantine fires.
+    """
+    proxy._compression_timed_out_in_flight = 1
+    proxy._compression_quarantine_deadline = (
+        time.monotonic() + proxy._compression_quarantine_max_seconds
+    )
+
+
 def test_handlers_offload_token_counting_and_batch_apply() -> None:
     """Wiring guard: the request paths must use the offloaded helpers, not inline
     get_tokenizer/count_messages or pipeline.apply on the event loop."""
@@ -177,7 +191,7 @@ async def test_count_tokens_offloaded_fails_open_on_executor_quarantine() -> Non
     proxy = _make_proxy()
     # Record a concurrent compression as timed out so the real executor guard
     # quarantines the next call — no mock of the helper itself.
-    proxy._compression_timed_out_in_flight = 1
+    _quarantine_compression(proxy)
 
     tokenizer, tokens = await proxy._count_tokens_offloaded(
         "qwen2.5-coder", [{"role": "user", "content": "hello world"}]
@@ -193,7 +207,7 @@ async def test_count_tokens_offloaded_returns_count_text_capable_tokenizer() -> 
     that need per-fragment accounting."""
     proxy = _make_proxy()
     # Quarantine forces the fail-open branch (an EstimatingTokenCounter).
-    proxy._compression_timed_out_in_flight = 1
+    _quarantine_compression(proxy)
 
     # The empty-messages count is intentionally discarded by that handler
     # (it sums text parts itself), so only the tokenizer matters here.

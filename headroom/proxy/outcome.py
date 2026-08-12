@@ -51,6 +51,9 @@ class RequestOutcome:
     """
 
     # ── Identity ──────────────────────────────────────────────────────
+    # request_id: unique per emission — it becomes the RequestLog key the
+    #     dashboard feed renders with (Alpine ``:key``), so duplicates blank
+    #     the whole table (#310/#2164).
     request_id: str
     provider: str
     model: str
@@ -91,6 +94,12 @@ class RequestOutcome:
     # no provider count (or whose optimized_tokens is already provider-scaled)
     # leaves it 0 and billing falls back to optimized_tokens, exactly as before.
     provider_input_tokens: int = 0
+    # Id used for the ``[...]`` PERF/log prefix when it must differ from
+    # ``request_id``. The Codex WS handler mints a fresh request_id per turn so
+    # the dashboard feed keys stay unique (#310/#2164), but wants every log line
+    # of one session greppable under the session id. Empty means "same as
+    # request_id", so the other emit sites are unaffected.
+    log_request_id: str = ""
 
     # ── Cache (provider-agnostic; unused fields stay 0) ───────────────
     # Anthropic populates all five (read + write + 5m + 1h + uncached).
@@ -565,7 +574,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     tool_saved = tool_schema_saved_from_tags(outcome.tags or {})
     total_saved = headline_tokens_saved(outcome.tokens_saved, outcome.tags or {})
     logger.info(
-        f"[{outcome.request_id}] PERF "
+        f"[{outcome.log_request_id or outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
