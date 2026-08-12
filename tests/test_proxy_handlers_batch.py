@@ -266,8 +266,8 @@ async def test_gemini_native_ccr_continuation(monkeypatch: pytest.MonkeyPatch) -
         call.tool_call_id,
         json.dumps({"hash": call.hash_key, "original_content": [{"type": "code"}]}),
         True,
-        1,
-        "headroom_retrieve",
+        items_retrieved=1,
+        tool_name="headroom_retrieve",
     )
 
     response = await handler.handle_gemini_generate_content(
