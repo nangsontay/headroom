@@ -347,6 +347,112 @@ def log_outbound_request(
     )
 
 
+def count_cache_breakpoints(
+    system: Any,
+    messages: Any,
+    tools: Any,
+) -> dict[str, int]:
+    """Count client ``cache_control`` breakpoints per request section.
+
+    Besides raw counts, records how far from the END of the message list the
+    last marker sits (``last_marker_tail`` = messages after the last marked
+    one). A dropped or backward-moved final breakpoint — the signature of a
+    "large uncached tail next to a healthy cache read" billing regression —
+    shows up as ``last_marker_tail`` growing between inbound and outbound.
+    Nested markers inside ``tool_result`` list content are counted too, so a
+    transform that rewrites sub-blocks can't lose one invisibly.
+    """
+    system_count = 0
+    if isinstance(system, list):
+        system_count = sum(1 for b in system if isinstance(b, dict) and "cache_control" in b)
+
+    tools_count = 0
+    if isinstance(tools, list):
+        tools_count = sum(1 for t in tools if isinstance(t, dict) and "cache_control" in t)
+
+    message_count = 0
+    messages_total = 0
+    last_marker_index = -1
+    if isinstance(messages, list):
+        message_count = len(messages)
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            found = 1 if "cache_control" in msg else 0
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if "cache_control" in block:
+                        found += 1
+                    inner = block.get("content")
+                    if isinstance(inner, list):
+                        found += sum(
+                            1 for sub in inner if isinstance(sub, dict) and "cache_control" in sub
+                        )
+            if found:
+                messages_total += found
+                last_marker_index = i
+
+    last_marker_tail = message_count - 1 - last_marker_index if last_marker_index >= 0 else -1
+    return {
+        "system": system_count,
+        "tools": tools_count,
+        "messages": messages_total,
+        "total": system_count + tools_count + messages_total,
+        "message_count": message_count,
+        "last_marker_tail": last_marker_tail,
+    }
+
+
+def log_cache_breakpoints(
+    *,
+    request_id: str | None,
+    inbound: dict[str, int],
+    outbound: dict[str, int],
+) -> None:
+    """One structured line per request: client breakpoints in vs forwarded out.
+
+    Per realignment build constraints: every cache-affecting decision is
+    logged. Escalates to WARNING when the forwarded request has fewer
+    breakpoints than the client sent, or the last marker moved further from
+    the end of the message list — either one silently un-caches the tail.
+    """
+    dropped = outbound["total"] < inbound["total"]
+    tail_grew = (
+        inbound["last_marker_tail"] >= 0
+        and outbound["last_marker_tail"] != inbound["last_marker_tail"]
+        and (
+            outbound["last_marker_tail"] < 0
+            or outbound["last_marker_tail"] > inbound["last_marker_tail"]
+        )
+    )
+    log = logger.warning if (dropped or tail_grew) else logger.info
+    log(
+        "event=cache_breakpoints request_id=%s "
+        "in_total=%d out_total=%d in_system=%d out_system=%d "
+        "in_tools=%d out_tools=%d in_messages=%d out_messages=%d "
+        "in_msg_count=%d out_msg_count=%d in_last_tail=%d out_last_tail=%d "
+        "dropped=%s tail_grew=%s",
+        request_id or "",
+        inbound["total"],
+        outbound["total"],
+        inbound["system"],
+        outbound["system"],
+        inbound["tools"],
+        outbound["tools"],
+        inbound["messages"],
+        outbound["messages"],
+        inbound["message_count"],
+        outbound["message_count"],
+        inbound["last_marker_tail"],
+        outbound["last_marker_tail"],
+        "true" if dropped else "false",
+        "true" if tail_grew else "false",
+    )
+
+
 def log_memory_injection(
     *,
     request_id: str,
@@ -2284,6 +2390,31 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
+    """Return whether Anthropic server-side tool search is valid for this upstream."""
+    from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+
+    return not is_custom_anthropic_base_url(api_base_url)
+
+
+def strip_first_party_tool_search_tools_for_third_party_upstream(
+    tools: Any,
+    api_base_url: str | None,
+) -> Any:
+    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream."""
+    if not isinstance(tools, list) or anthropic_first_party_tool_search_supported(api_base_url):
+        return tools
+    filtered = [
+        tool
+        for tool in tools
+        if not (
+            isinstance(tool, dict)
+            and str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        )
+    ]
+    return filtered if len(filtered) != len(tools) else tools
+
+
 def inject_tool_search_deferral(
     tools: Any,
     *,
@@ -2365,6 +2496,117 @@ def inject_tool_search_deferral(
 
 
 # ---------------------------------------------------------------------------
+# Tool-search history repair (issue #2805).
+#
+# Once the deferral above is active, Anthropic answers with ``server_tool_use``
+# (the search) + ``tool_search_tool_result`` (a list of ``tool_reference``
+# entries) blocks, and the client writes them into its transcript permanently.
+# Anthropic validates every ``tool_reference`` in the history against the
+# request's ``tools`` array and 400s with
+# ``Tool reference 'X' not found in available tools`` when one is missing.
+#
+# That is fine for a client's main loop — the proxy re-injects the same tools
+# array every turn — but Claude Code also replays the SAME transcript on
+# side-requests that carry a different, smaller tools array (the prompt-type
+# Stop hook evaluator, /compact, …). The proxy cannot predict those tool sets,
+# so instead we repair the history: when the outbound request cannot support
+# the tool-search blocks, drop them. Deterministic (same request → same output,
+# so the prefix still caches), stateless (no session bookkeeping), and
+# self-healing for transcripts already poisoned before the fix.
+# ---------------------------------------------------------------------------
+
+_TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+
+
+def _tool_search_reference_names(content: Any) -> list[str]:
+    """Return the ``tool_reference`` names carried by a tool-search result block.
+
+    Server-side results nest them (``content.tool_references``); a client-side
+    tool-search implementation returns the bare list. Accept both.
+    """
+    entries = content.get("tool_references") if isinstance(content, dict) else content
+    if not isinstance(entries, list):
+        return []
+    names = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("type") == "tool_reference":
+            # Server-side blocks use ``tool_name``; be liberal about ``name``.
+            name = entry.get("tool_name") or entry.get("name")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Drop tool-search blocks this request's ``tools`` array cannot support.
+
+    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
+    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
+    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
+    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
+    message left with no content blocks is dropped rather than sent empty.
+
+    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
+    when nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    has_search_tool = any(
+        isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        for t in tool_list
+    )
+
+    out: list[Any] = []
+    removed = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        drop_indexes: set[int] = set()
+        orphaned_ids: set[str] = set()
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+                continue
+            names = _tool_search_reference_names(block.get("content"))
+            if has_search_tool and all(name in available for name in names):
+                continue
+            drop_indexes.add(index)
+            use_id = block.get("tool_use_id")
+            if use_id:
+                orphaned_ids.add(str(use_id))
+        # The search call itself precedes its result, so pair it up in a second
+        # pass. Only tool-search server calls are eligible — web_search and code
+        # execution use the same block type and must survive untouched.
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "server_tool_use":
+                continue
+            is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
+                drop_indexes.add(index)
+
+        if not drop_indexes:
+            out.append(message)
+            continue
+
+        changed = True
+        removed += len(drop_indexes)
+        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
+        if not kept:
+            continue  # the whole turn was tool-search bookkeeping
+        repaired = dict(message)
+        repaired["content"] = kept
+        out.append(repaired)
+
+    return (out, removed) if changed else (messages, 0)
+
+
+# ---------------------------------------------------------------------------
 # Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
 #
 # The OpenAI-side analogue of inject_tool_search_deferral above. OpenAI shipped
@@ -2374,7 +2616,11 @@ def inject_tool_search_deferral(
 # (only name+description remain) until the model searches for one — while every
 # tool stays callable and the prompt cache is preserved. Same win as Anthropic
 # (~15-25k tool-schema tokens -> ~200) for clients that ship a big tool surface
-# and never opt into tool search themselves (opencode, plain API clients).
+# and never opt into tool search themselves (plain API clients).
+#
+# Two harnesses are excluded. Codex drops deferred-call namespaces during its
+# round trip, while GH #2660 reports OpenCode rejecting the injected
+# `tool_search` tool as unavailable. Their tools therefore stay resident.
 #
 # Differences from the Anthropic path that require a separate function:
 #   * Responses function tools carry ``type: "function"`` (Anthropic real tools
@@ -2389,7 +2635,7 @@ def inject_tool_search_deferral(
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -2437,8 +2683,9 @@ def inject_tool_search_deferral_openai(
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
-    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex and OpenCode, whose harnesses cannot safely execute the
+    injected search tool. Also no-op when: the model doesn't support tool search
+    (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,

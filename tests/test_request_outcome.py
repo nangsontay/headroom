@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -296,6 +297,11 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         "cache_write_1h_tokens": 20,
         "uncached_tokens": 0,
         "output_tokens": 50,
+        # Tells cost whether cache_write_tokens was REPORTED by the provider or
+        # derived from the uncached portion. An inferred value is the same tokens
+        # as uncached_tokens, so counting it in the billed prompt total would
+        # double it. Defaults False for providers with disjoint buckets.
+        "cache_inferred": False,
     }
 
 
@@ -318,6 +324,22 @@ async def test_funnel_logs_request_with_derived_cache_hit() -> None:
     assert len(h.logger.logs) == 1
     log_entry = h.logger.logs[0]
     assert log_entry.cache_hit is True
+
+
+@pytest.mark.asyncio
+async def test_funnel_logs_request_timestamp_with_utc_offset() -> None:
+    """Recent-request timestamps must identify an absolute instant.
+
+    A naive ISO timestamp is interpreted in the browser's local timezone,
+    which makes the dashboard show negative ages when the proxy and browser
+    use different timezone settings.
+    """
+    h = _FunnelHarness()
+    await h._record_request_outcome(_outcome())
+
+    timestamp = datetime.fromisoformat(h.logger.logs[0].timestamp)
+    assert timestamp.tzinfo is not None
+    assert timestamp.utcoffset() == timezone.utc.utcoffset(timestamp)
 
 
 @pytest.mark.asyncio
