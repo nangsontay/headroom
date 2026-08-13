@@ -265,6 +265,17 @@ def test_build_manifest_persists_intercept_tool_results() -> None:
     manifest = build_manifest(**_base_manifest_kwargs(intercept_tool_results=True))
 
     assert "--intercept-tool-results" in manifest.proxy_args
+    assert manifest.base_env["HEADROOM_ROLLOUT_CHANNEL"] == "canary"
+
+
+def test_build_manifest_rejects_interceptor_below_required_rollout_channel() -> None:
+    with pytest.raises(click.ClickException, match="requires HEADROOM_ROLLOUT_CHANNEL=canary"):
+        build_manifest(
+            **_base_manifest_kwargs(
+                intercept_tool_results=True,
+                extra_env={"HEADROOM_ROLLOUT_CHANNEL": "stable"},
+            )
+        )
 
 
 def test_build_manifest_persists_protect_tool_results() -> None:

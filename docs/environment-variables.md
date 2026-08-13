@@ -64,7 +64,7 @@ tool-result interception (§2 Compression); and the embedding-server sidecar (§
 | `HEADROOM_OPTIMIZE` | bool | `true` | Master optimization switch. `false` = passthrough (no compression); mirrors `--no-optimize`. |
 | `HEADROOM_CACHE_ENABLED` | bool | `true` | Semantic response cache. `false` mirrors `--no-cache`. |
 | `HEADROOM_RATE_LIMIT_ENABLED` | bool | `true` | Enforce RPM/TPM limits. `false` mirrors `--no-rate-limit`. |
-| `HEADROOM_INTERCEPT_ENABLED` | bool | `false` | Enable ast-grep tool_result interceptors (Read outliner); mirrors `--intercept-tool-results`. |
+| `HEADROOM_INTERCEPT_ENABLED` | bool | `false` | Enable ast-grep tool_result interceptors (Read outliner); mirrors `--intercept-tool-results`. Rollout-gated: a legacy alias for the `tool_result_interceptors` feature, so it also needs `HEADROOM_ROLLOUT_CHANNEL=canary` or higher. |
 | `HEADROOM_SAVINGS_PROFILE` | enum | `coding` | Named compression posture: `agent-90`, `balanced`, `coding`, `general`. |
 | `HEADROOM_TARGET_RATIO` | float 0-1 | adaptive | Kompress keep-ratio (lower = more aggressive). |
 | `HEADROOM_DISABLE_KOMPRESS` | bool | `false` | Disable Kompress ML compression (structural compression stays on). |
