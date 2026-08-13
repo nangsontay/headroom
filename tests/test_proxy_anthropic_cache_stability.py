@@ -671,6 +671,109 @@ def test_output_shaper_pins_the_level_the_frozen_prefix_was_built_at(monkeypatch
             assert fake_tracker.output_shaping_level == 2
 
 
+@pytest.mark.parametrize("drift", ["shaper_disabled", "arm_control"])
+def test_output_shaper_replays_pinned_tail_when_shaping_stops(monkeypatch, drift: str) -> None:
+    """Shaping stopping mid-conversation must not drop an established tail.
+
+    The pin is consulted before the enablement and arm gates: a conversation
+    that froze with an L2 tail keeps sending those exact system bytes even once
+    the shaper is disabled or its arm drifts into control. Dropping the tail
+    invalidates the whole provider prefix, the same bust as adding one.
+    Experiment attribution stays with the live assignment — a replay never
+    records a treatment label.
+    """
+    from headroom.proxy import runtime_env
+    from headroom.proxy.output_savings_policy import _STRATUM_LABEL
+    from headroom.proxy.output_verbosity_policy import STEERING_SENTINEL
+    from headroom.rollout import resolve_rollout
+
+    runtime_env.clear_overrides()
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    # Rollout-gated as in the tests above: beta is required for the shaper to
+    # run at all.
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        proxy.config.ccr_proactive_expansion = False
+
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages, **_kwargs: "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_shape_3",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        def _post() -> str:
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "system": "base system",
+                    "messages": [
+                        {"role": "user", "content": "frozen prefix"},
+                        {"role": "assistant", "content": "ack"},
+                        {"role": "user", "content": "latest user"},
+                    ],
+                },
+            )
+            assert response.status_code == 200
+            return response.headers.get("x-headroom-transforms", "")
+
+        # Turn 1: shaped and pinned, establishing the L2 system bytes.
+        transforms = _post()
+        established = captured["body"]["system"]
+        assert STEERING_SENTINEL in str(established)
+        assert fake_tracker.output_shaping_level == 2
+        assert _STRATUM_LABEL in transforms
+
+        # Turn N: the prefix is frozen and shaping stops for this conversation.
+        fake_tracker._frozen_count = 1
+        if drift == "shaper_disabled":
+            # Enablement is a resolved snapshot since #1490, so a live disable
+            # reaches the handler as a re-resolved gate with the legacy alias
+            # falsey — the same route a rollout-channel demotion takes.
+            proxy.config.rollout = resolve_rollout(
+                {"HEADROOM_ROLLOUT_CHANNEL": "beta", "HEADROOM_OUTPUT_SHAPER": "0"}
+            )
+        else:
+            monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1")
+        transforms = _post()
+        assert captured["body"]["system"] == established
+        assert fake_tracker.output_shaping_level == 2
+
+        # The treatment path is unreachable in both drifts, so surviving bytes
+        # can only have come from the replay. The missing treatment label is
+        # what proves the drift actually took effect — and that a cache replay
+        # is never counted as a treatment observation.
+        assert _STRATUM_LABEL not in transforms
+
+
 def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
     captured = {"inject_system": None}
     with _make_proxy_client() as client:
