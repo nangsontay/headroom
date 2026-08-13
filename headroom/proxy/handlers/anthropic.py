@@ -2280,79 +2280,104 @@ class AnthropicHandlerMixin:
                         session_id=session_id,
                     )
                     expansion_dedup_tracker = None
+                    claimed_hash_keys: list[str] = []
+                    injected_hash_keys: set[str] = set()
                     if recommendations and session_id:
                         from headroom.proxy.helpers import (
                             get_session_expansion_dedup_tracker,
                         )
 
                         expansion_dedup_tracker = get_session_expansion_dedup_tracker()
-                        new_hash_keys = set(
-                            expansion_dedup_tracker.filter_new(
-                                session_id, [r.hash_key for r in recommendations]
-                            )
+                        # Atomic reservation, not a read-only filter: these
+                        # hashes are hidden from every concurrent request for
+                        # this session as of this call, and handed back in the
+                        # `finally` below if this request does not append them.
+                        # Selecting here and recording only after the append
+                        # would let two concurrent turns of one session (a
+                        # normal path for shared-session agents) both pass and
+                        # both inject the same hash — the duplicate this dedup
+                        # exists to prevent.
+                        claimed_hash_keys = expansion_dedup_tracker.claim(
+                            session_id, [r.hash_key for r in recommendations]
                         )
-                        recommendations = [
-                            r for r in recommendations if r.hash_key in new_hash_keys
-                        ]
-                    if recommendations:
-                        expansions = self.ccr_context_tracker.execute_expansions(recommendations)
-                        if expansions:
-                            # Add expanded context to the system message or as additional context.
-                            # Pass workspace_label so the injected block declares its provenance
-                            # — symmetric with the memory-injection block header.
-                            expansion_text = self.ccr_context_tracker.format_expansions_for_context(
-                                expansions,
-                                workspace_label=ccr_workspace_label,
+                        claimed = set(claimed_hash_keys)
+                        recommendations = [r for r in recommendations if r.hash_key in claimed]
+                    try:
+                        if recommendations:
+                            expansions = self.ccr_context_tracker.execute_expansions(
+                                recommendations
                             )
-                            logger.info(
-                                f"[{request_id}] CCR: Proactively expanded {len(expansions)} context(s) "
-                                f"based on query relevance"
-                            )
-                            if is_cache_mode(self.config.mode):
+                            if expansions:
+                                # Add expanded context to the system message or as additional
+                                # context. Pass workspace_label so the injected block declares
+                                # its provenance — symmetric with the memory-injection header.
+                                expansion_text = (
+                                    self.ccr_context_tracker.format_expansions_for_context(
+                                        expansions,
+                                        workspace_label=ccr_workspace_label,
+                                    )
+                                )
                                 logger.info(
-                                    f"[{request_id}] CCR: skipping proactive expansion append "
-                                    "in cache mode to preserve next-turn prefix stability"
+                                    f"[{request_id}] CCR: Proactively expanded "
+                                    f"{len(expansions)} context(s) based on query relevance"
                                 )
-                            elif injection_target_already_forwarded(
-                                optimized_messages,
-                                prefix_tracker=prefix_tracker,
-                                target_index=latest_non_frozen_user_turn_index(
+                                if is_cache_mode(self.config.mode):
+                                    logger.info(
+                                        f"[{request_id}] CCR: skipping proactive expansion append "
+                                        "in cache mode to preserve next-turn prefix stability"
+                                    )
+                                elif injection_target_already_forwarded(
                                     optimized_messages,
-                                    frozen_message_count=frozen_message_count,
-                                ),
-                            ):
-                                logger.info(
-                                    f"[{request_id}] CCR: skipping proactive expansion append — "
-                                    "target position already forwarded last turn "
-                                    "(would double-inject, #2186)"
-                                )
-                            else:
-                                new_optimized = self._append_context_to_latest_non_frozen_user_turn(
-                                    optimized_messages,
-                                    expansion_text,
-                                    frozen_message_count=frozen_message_count,
-                                )
-                                # The helper returns the SAME list object unchanged
-                                # when the latest turn is frozen or has no eligible
-                                # text block — nothing was injected, so don't mark
-                                # the hashes as seen (a later turn may retry) and
-                                # don't bill a drawback that never happened.
-                                if new_optimized is not optimized_messages:
-                                    optimized_messages = new_optimized
-                                    if expansion_dedup_tracker and session_id:
-                                        expansion_dedup_tracker.record_injected(
-                                            session_id, [e["hash"] for e in expansions]
-                                        )
-                                    # Defer recording: bind the drawback to this
-                                    # request. The outcome funnel books it only
-                                    # after the upstream forward succeeds, so a
-                                    # failed request never inflates net savings.
-                                    set_pending_proactive_retrieval(
-                                        (
-                                            len(expansions),
-                                            sum(int(e.get("tokens", 0) or 0) for e in expansions),
+                                    prefix_tracker=prefix_tracker,
+                                    target_index=latest_non_frozen_user_turn_index(
+                                        optimized_messages,
+                                        frozen_message_count=frozen_message_count,
+                                    ),
+                                ):
+                                    logger.info(
+                                        f"[{request_id}] CCR: skipping proactive expansion append "
+                                        "— target position already forwarded last turn "
+                                        "(would double-inject, #2186)"
+                                    )
+                                else:
+                                    new_optimized = (
+                                        self._append_context_to_latest_non_frozen_user_turn(
+                                            optimized_messages,
+                                            expansion_text,
+                                            frozen_message_count=frozen_message_count,
                                         )
                                     )
+                                    # The helper returns the SAME list object unchanged
+                                    # when the latest turn is frozen or has no eligible
+                                    # text block — nothing was injected, so the claim is
+                                    # released below, a later turn may retry, and no
+                                    # drawback is billed for an append that never happened.
+                                    if new_optimized is not optimized_messages:
+                                        optimized_messages = new_optimized
+                                        injected_hash_keys = {e["hash"] for e in expansions}
+                                        # Defer recording: bind the drawback to this
+                                        # request. The outcome funnel books it only
+                                        # after the upstream forward succeeds, so a
+                                        # failed request never inflates net savings.
+                                        set_pending_proactive_retrieval(
+                                            (
+                                                len(expansions),
+                                                sum(
+                                                    int(e.get("tokens", 0) or 0) for e in expansions
+                                                ),
+                                            )
+                                        )
+                    finally:
+                        # Every claim that did not reach the forwarded body goes
+                        # back to the eligible pool: expansion returned nothing
+                        # or a subset, cache mode skipped the append, the target
+                        # was already forwarded, the tail was ineligible, or the
+                        # body raised. Keeping a claim this request never used
+                        # would silently retire that hash for the whole session.
+                        if expansion_dedup_tracker and session_id:
+                            unused = [h for h in claimed_hash_keys if h not in injected_hash_keys]
+                            if unused:
+                                expansion_dedup_tracker.release(session_id, unused)
 
             # Traffic Learner: Extract patterns from inbound tool results
             if self.traffic_learner:

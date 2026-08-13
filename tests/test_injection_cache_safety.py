@@ -11,10 +11,16 @@ fix, that append ran unconditionally in token mode:
       diverges from what the provider hashed, and busts from there on.
   (b) ``execute_expansions`` had no per-session dedup, so the same
       compressed-content hash could be re-injected across requests.
+      Selection is an atomic claim (reserve on select, release when the
+      append does not happen) — a read-only filter plus a record-after-
+      append let two concurrent turns of one session both win the same hash.
   (c) Claude Code's ``/compact`` starts a new session (new conversation-
       scoped session id, phase 2), but the process-wide ``ContextTracker``
       is workspace-scoped only, so old compressed content tracked under the
       pre-compact session could surface right back into the fresh one.
+      Ownership is a SET of sessions: ``_contexts`` is keyed by content hash
+      alone, so a second session tracking identical content must not
+      overwrite the first's ownership.
 
 This covers all three at the unit level: the shared guard
 (``injection_target_already_forwarded``) together with the index finders that
@@ -267,45 +273,112 @@ def test_expansion_dedup_blocks_repeat_hash_same_session() -> None:
     """(b) Same hash proposed twice in one session -> injected only once."""
     dedup = SessionExpansionDedupTracker(max_sessions=10)
 
-    first = dedup.filter_new("session-a", ["hash1", "hash2"])
+    first = dedup.claim("session-a", ["hash1", "hash2"])
     assert first == ["hash1", "hash2"]
-    dedup.record_injected("session-a", first)
 
-    second = dedup.filter_new("session-a", ["hash1", "hash2", "hash3"])
+    second = dedup.claim("session-a", ["hash1", "hash2", "hash3"])
     assert second == ["hash3"]
 
 
 def test_expansion_dedup_is_per_session_not_global() -> None:
     """(b) Different sessions may legitimately need the same expansion."""
     dedup = SessionExpansionDedupTracker(max_sessions=10)
-    dedup.record_injected("session-a", ["hash1"])
+    dedup.claim("session-a", ["hash1"])
 
-    assert dedup.filter_new("session-b", ["hash1"]) == ["hash1"]
-    assert dedup.filter_new("session-a", ["hash1"]) == []
+    assert dedup.claim("session-b", ["hash1"]) == ["hash1"]
+    assert dedup.claim("session-a", ["hash1"]) == []
 
 
 def test_expansion_dedup_lru_eviction() -> None:
-    """(b) Oldest session ages out once the bound is exceeded."""
-    dedup = SessionExpansionDedupTracker(max_sessions=1)
-    dedup.record_injected("session-a", ["hash1"])
-    dedup.record_injected("session-b", ["hash2"])  # evicts session-a
+    """(b) Oldest session ages out once the bound is exceeded.
 
-    assert dedup.filter_new("session-a", ["hash1"]) == ["hash1"]
-    assert dedup.filter_new("session-b", ["hash2"]) == []
+    Probe the surviving session first: a claim is a write, so at
+    ``max_sessions=1`` asking about the evicted session re-admits it and
+    evicts the survivor in turn.
+    """
+    dedup = SessionExpansionDedupTracker(max_sessions=1)
+    dedup.claim("session-a", ["hash1"])
+    dedup.claim("session-b", ["hash2"])  # evicts session-a
+
+    assert dedup.claim("session-b", ["hash2"]) == []
+    assert dedup.claim("session-a", ["hash1"]) == ["hash1"]
 
 
 def test_expansion_dedup_read_refreshes_recency() -> None:
     """(b) A session that is only *queried* still counts as used, otherwise it
     is evicted while active and its hashes get expanded a second time."""
     dedup = SessionExpansionDedupTracker(max_sessions=2)
-    dedup.record_injected("session-a", ["hash1"])
-    dedup.record_injected("session-b", ["hash2"])
+    dedup.claim("session-a", ["hash1"])
+    dedup.claim("session-b", ["hash2"])
 
-    assert dedup.filter_new("session-a", ["hash1"]) == []  # touches session-a
-    dedup.record_injected("session-c", ["hash3"])  # evicts the LRU (session-b)
+    assert dedup.claim("session-a", ["hash1"]) == []  # touches session-a
+    dedup.claim("session-c", ["hash3"])  # evicts the LRU (session-b)
 
-    assert dedup.filter_new("session-a", ["hash1"]) == []
-    assert dedup.filter_new("session-b", ["hash2"]) == ["hash2"]
+    assert dedup.claim("session-a", ["hash1"]) == []
+    assert dedup.claim("session-b", ["hash2"]) == ["hash2"]
+
+
+def test_claim_hides_hash_from_a_concurrent_request_immediately() -> None:
+    """(b) Deterministic interleaving: A claims, pauses BEFORE appending, B
+    tries the same hash. Exactly one may proceed.
+
+    The check-then-act shape this replaces (read the seen-set, release the
+    lock, append, record afterwards) let both requests pass selection and
+    both append the same hash — the duplicate the dedup exists to prevent.
+    """
+    dedup = SessionExpansionDedupTracker(max_sessions=10)
+
+    # Request A: selection happens, then A is suspended mid-flight (expansion
+    # execution / guards / append all still ahead of it).
+    a_claim = dedup.claim("session-a", ["hash1"])
+    assert a_claim == ["hash1"]
+
+    # Request B arrives for the same session while A is still paused.
+    b_claim = dedup.claim("session-a", ["hash1"])
+    assert b_claim == []
+
+    assert len(a_claim) + len(b_claim) == 1  # exactly one winner
+
+
+def test_release_makes_a_skipped_claim_eligible_again() -> None:
+    """(b) A claim that never reached the wire must not retire the hash.
+
+    Covers every skip path in the handler — expansion returned nothing,
+    cache mode, the already-forwarded target guard, an ineligible tail, or
+    the body raising — all of which release in the `finally`.
+    """
+    dedup = SessionExpansionDedupTracker(max_sessions=10)
+
+    claimed = dedup.claim("session-a", ["hash1", "hash2"])
+    assert claimed == ["hash1", "hash2"]
+    assert dedup.claim("session-a", ["hash1", "hash2"]) == []  # hidden while held
+
+    dedup.release("session-a", claimed)  # A skipped the append
+
+    assert dedup.claim("session-a", ["hash1", "hash2"]) == ["hash1", "hash2"]
+
+
+def test_release_returns_only_the_unused_subset_of_a_claim() -> None:
+    """(b) Partial expansion: the appended hash stays retired, the rest of the
+    claim goes back. ``execute_expansions`` may return fewer entries than were
+    recommended, and the handler releases exactly the difference."""
+    dedup = SessionExpansionDedupTracker(max_sessions=10)
+
+    claimed = dedup.claim("session-a", ["appended", "dropped"])
+    assert claimed == ["appended", "dropped"]
+
+    dedup.release("session-a", ["dropped"])
+
+    assert dedup.claim("session-a", ["appended", "dropped"]) == ["dropped"]
+
+
+def test_release_of_an_unknown_session_is_a_noop() -> None:
+    """(b) An evicted session must not resurrect an empty entry on release."""
+    dedup = SessionExpansionDedupTracker(max_sessions=10)
+
+    dedup.release("session-gone", ["hash1"])
+
+    assert dedup.claim("session-gone", ["hash1"]) == ["hash1"]
 
 
 # ─── (c) ContextTracker session-scoped analyze_query (/compact repro) ──────
@@ -370,6 +443,41 @@ def test_analyze_query_without_session_id_keeps_legacy_workspace_only_scoping() 
     assert len(recs) == 1
 
 
+def test_same_content_in_two_sessions_keeps_both_owners_eligible() -> None:
+    """(c) ``_contexts`` is keyed by content hash alone, so two sessions that
+    compress identical content share one entry. Tracking it in session B must
+    ADD B as an owner, not overwrite A — otherwise A silently loses
+    eligibility for a context it still holds."""
+    tracker = ContextTracker(ContextTrackerConfig(enabled=True, proactive_expansion=True))
+    for session in ("session-a", "session-b"):
+        tracker.track_compression(
+            hash_key="same-content",  # content-addressed: identical bytes -> one entry
+            turn_number=1,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            workspace_key="ws-repo",
+            session_id=session,
+            query_context="find auth files",
+            sample_content="auth_middleware.py handles authentication",
+        )
+
+    query = "what about the authentication middleware?"
+    for session in ("session-a", "session-b"):
+        recs = tracker.analyze_query(
+            query, current_turn=1, workspace_key="ws-repo", session_id=session
+        )
+        assert [r.hash_key for r in recs] == ["same-content"], f"{session} lost its own context"
+
+    # A third, unrelated session still gets nothing (the filter still filters).
+    assert (
+        tracker.analyze_query(
+            query, current_turn=1, workspace_key="ws-repo", session_id="session-c"
+        )
+        == []
+    )
+
+
 # ─── handler wiring tripwire ──────────────────────────────────────────────
 
 
@@ -390,8 +498,8 @@ def test_anthropic_handler_wires_expansion_dedup_and_forwarded_guard() -> None:
     src = inspect.getsource(anthropic_handler)
     for needle in (
         "get_session_expansion_dedup_tracker",
-        ".filter_new(",
-        ".record_injected(",
+        ".claim(",
+        ".release(",
         "injection_target_already_forwarded",
         "target_index=latest_non_frozen_user_turn_index(",
     ):

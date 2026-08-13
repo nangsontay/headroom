@@ -88,7 +88,13 @@ class CompressedContext:
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
-    session_id: str | None = None  # Conversation identity (see analyze_query)
+    # Every conversation that has tracked this content (see analyze_query).
+    # A SET, not one id: `_contexts` is keyed by content hash alone, so two
+    # sessions compressing identical content land on the same entry. Storing
+    # a single id let the second session's re-track overwrite the first's,
+    # and session A then lost eligibility for a context it still owned.
+    # Empty = legacy/no-session tracking, scoped by workspace only.
+    session_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -198,6 +204,15 @@ class ContextTracker:
             )
             return
 
+        # Content-addressed entry: a re-track of the same hash from another
+        # session ADDS that session as an owner instead of replacing the
+        # previous one. Overwriting evicted the first session's ownership and
+        # cost it eligibility for content it still held.
+        previous = self._contexts.get(hash_key)
+        session_ids = previous.session_ids if previous else frozenset()
+        if session_id is not None:
+            session_ids = session_ids | {session_id}
+
         context = CompressedContext(
             hash_key=hash_key,
             turn_number=turn_number,
@@ -208,11 +223,11 @@ class ContextTracker:
             query_context=query_context,
             sample_content=sample_content[:2000],  # Limit sample size
             workspace_key=workspace_key,
-            session_id=session_id,
+            session_ids=session_ids,
         )
 
         # Add or update context
-        if hash_key in self._contexts:
+        if previous is not None:
             self._turn_order.remove(hash_key)
         self._contexts[hash_key] = context
         self._turn_order.append(hash_key)
@@ -288,12 +303,15 @@ class ContextTracker:
             # Session filter (#2186): a NEW session (e.g. started after
             # Claude Code's /compact) must not have old compressed content
             # surfaced back into it — the whole point of compacting was to
-            # drop it. Only enforced when both sides have a concrete id;
+            # drop it. Only enforced when both sides have concrete ids;
             # legacy/no-session callers keep workspace-only scoping.
+            # Membership, not equality: a hash tracked by several sessions
+            # stays eligible for every one of them (same-content parallel
+            # sessions must not evict each other).
             if (
                 session_id is not None
-                and context.session_id is not None
-                and context.session_id != session_id
+                and context.session_ids
+                and session_id not in context.session_ids
             ):
                 continue
 

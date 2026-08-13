@@ -105,13 +105,28 @@ class SessionExpansionDedupTracker:
         self._lock = threading.RLock()
         self._sessions: OrderedDict[str, set[str]] = OrderedDict()
 
-    def filter_new(self, session_id: str, hash_keys: list[str]) -> list[str]:
-        """Return the subset of hash_keys not yet injected for this session.
+    def claim(self, session_id: str, hash_keys: list[str]) -> list[str]:
+        """Atomically reserve and return the hash_keys still eligible here.
 
-        Counts as a use: an active session that keeps being *asked* about
-        without recording anything new must not age out behind other
-        sessions, or its already-seen hashes come back and get proactively
-        expanded a second time.
+        Selection and recording happen under ONE lock hold: a claimed hash
+        is invisible to every other request for this session the moment it
+        is handed out. A check-then-act split (select under the lock, record
+        after the append) lets two concurrent turns of the same session — a
+        normal path for shared-session agents — both select the same hash
+        and both append it, which is the duplicate this tracker exists to
+        prevent.
+
+        The claim IS the commit; there is no separate commit call. A caller
+        that ends up not appending MUST hand the hashes back via
+        :meth:`release`, otherwise they stay reserved for the session's
+        lifetime. Failing closed that way is deliberate: a dropped release
+        costs one missed optimization, a dropped claim costs a permanent
+        per-turn token tax (#2186).
+
+        Claiming counts as a use: an active session that keeps being
+        *asked* about without reserving anything new must not age out
+        behind other sessions, or its already-seen hashes come back and get
+        proactively expanded a second time.
         """
 
         if not session_id:
@@ -119,12 +134,27 @@ class SessionExpansionDedupTracker:
         with self._lock:
             seen = self._sessions.get(session_id)
             if seen is None:
-                return list(hash_keys)
+                if not hash_keys:
+                    return []
+                seen = set()
+                self._sessions[session_id] = seen
+            claimed = [h for h in hash_keys if h not in seen]
+            seen.update(claimed)
             self._sessions.move_to_end(session_id)
-            return [h for h in hash_keys if h not in seen]
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+            return claimed
 
-    def record_injected(self, session_id: str, hash_keys: list[str]) -> None:
-        """Mark hash_keys as injected for this session."""
+    def release(self, session_id: str, hash_keys: list[str]) -> None:
+        """Hand claimed hash_keys back to the eligible pool.
+
+        For every path that claims before knowing whether the append will
+        happen: expansion execution returning nothing or a subset,
+        cache-mode gating, the already-forwarded target guard, an
+        ineligible tail. Only pass hashes THIS request received from
+        :meth:`claim` — releasing another request's claim re-opens the
+        duplicate window.
+        """
 
         if not session_id:
             raise ValueError("session_id must be non-empty")
@@ -133,12 +163,9 @@ class SessionExpansionDedupTracker:
         with self._lock:
             seen = self._sessions.get(session_id)
             if seen is None:
-                seen = set()
-                self._sessions[session_id] = seen
-            seen.update(hash_keys)
+                return
+            seen.difference_update(hash_keys)
             self._sessions.move_to_end(session_id)
-            while len(self._sessions) > self._max_sessions:
-                self._sessions.popitem(last=False)
 
     def reset(self) -> None:
         """Clear all session state."""
