@@ -508,6 +508,10 @@ def test_output_shaper_respects_established_frozen_prefix(
 
     runtime_env.clear_overrides()
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    # The shaper is rollout-gated (proxy_output_shaper, available_in=beta), so
+    # the legacy alias alone leaves it blocked_by_channel on the default stable
+    # channel — same pairing as tests/test_openai_responses_output_shaper.py.
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
 
     captured = {}
     with _make_proxy_client() as client:
@@ -582,6 +586,8 @@ def test_output_shaper_pins_the_level_the_frozen_prefix_was_built_at(monkeypatch
 
     runtime_env.clear_overrides()
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    # Rollout-gated as above: beta is required for the shaper to run at all.
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "0")
 
     captured = {}
