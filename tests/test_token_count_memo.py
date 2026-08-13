@@ -11,6 +11,8 @@ EstimatingTokenCounter — the only tokenizer the proxy uses for Claude models
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from headroom.cache.token_count_memo import TokenCountMemo, count_messages_memoized
@@ -133,7 +135,7 @@ def test_memoized_count_handles_append_only_delta() -> None:
 
     count_messages_memoized(memo, tokenizer, turn1)
     prefix_key = TokenCountMemo.message_hash(turn1[0])
-    assert memo.get(prefix_key) is not None
+    assert memo.get(prefix_key, tokenizer=tokenizer) is not None
 
     memoized_turn2 = count_messages_memoized(memo, tokenizer, turn2)
     assert memoized_turn2 == tokenizer.count_messages(turn2)
@@ -174,21 +176,25 @@ def test_forced_digest_collision_never_aliases_unequal_messages(monkeypatch) -> 
 class TestTokenCountMemoEviction:
     def test_eviction_at_max_entries(self) -> None:
         memo = TokenCountMemo(max_entries=3)
-        memo.put("a", 1)
-        memo.put("b", 2)
-        memo.put("c", 3)
-        memo.get("a")  # touch "a" so it's not the least-recently-used
-        memo.put("d", 4)  # should evict "b" (oldest untouched)
+        tok = object()  # get/put require the bound tokenizer's identity
+        memo.bind_or_reset(tok)
+        memo.put("a", 1, tokenizer=tok)
+        memo.put("b", 2, tokenizer=tok)
+        memo.put("c", 3, tokenizer=tok)
+        memo.get("a", tokenizer=tok)  # touch "a" so it's not the least-recently-used
+        memo.put("d", 4, tokenizer=tok)  # should evict "b" (oldest untouched)
 
-        assert memo.get("a") == 1
-        assert memo.get("b") is None
-        assert memo.get("c") == 3
-        assert memo.get("d") == 4
+        assert memo.get("a", tokenizer=tok) == 1
+        assert memo.get("b", tokenizer=tok) is None
+        assert memo.get("c", tokenizer=tok) == 3
+        assert memo.get("d", tokenizer=tok) == 4
 
     def test_get_stats_reports_entry_count(self) -> None:
         memo = TokenCountMemo()
-        memo.put("a", 1)
-        memo.put("b", 2)
+        tok = object()
+        memo.bind_or_reset(tok)
+        memo.put("a", 1, tokenizer=tok)
+        memo.put("b", 2, tokenizer=tok)
         assert memo.get_stats()["entries"] == 2
 
 
@@ -258,3 +264,94 @@ class TestTokenizerCapabilityGuards:
         entries = memo.get_stats()["entries"]
         count_messages_memoized(memo, tokenizer, messages)
         assert memo.get_stats()["entries"] == entries  # no clear, warm hits
+
+
+class _GatedTokenizer:
+    """Additive tokenizer with a fixed per-message count and an interleaving hook.
+
+    ``per_message`` differs between the two instances so a cross-tokenizer leak
+    shows up as a wrong number rather than a coincidence.
+    """
+
+    ADDITIVE_COUNTS = True
+    REPLY_OVERHEAD = 0
+
+    def __init__(self, per_message: int, before_count: object = None) -> None:
+        self.per_message = per_message
+        self._before_count = before_count
+
+    def count_message(self, message: dict) -> int:  # noqa: ARG002
+        if self._before_count is not None:
+            self._before_count()
+        return self.per_message
+
+    def count_messages(self, messages: list[dict]) -> int:
+        return sum(self.count_message(m) for m in messages) + self.REPLY_OVERHEAD
+
+
+class TestCrossTokenizerRebindRace:
+    """The per-session memo is shared by concurrent requests, and the count
+    fail-open path (``proxy/token_counting._count_offloaded``) hands each
+    request a *fresh* ``EstimatingTokenCounter``. So request A can be mid-count
+    under tokenizer A while request B rebinds the memo to tokenizer B. A's
+    counts must never reach B.
+    """
+
+    def test_put_after_concurrent_rebind_never_leaks_to_new_binding(self) -> None:
+        messages = [{"role": "user", "content": "shared prefix message"}]
+        key = TokenCountMemo.message_hash(messages[0])
+        canonical = TokenCountMemo.canonical_message(messages[0])
+
+        a_is_counting = threading.Event()
+        b_has_rebound = threading.Event()
+
+        def _pause_a() -> None:
+            # A has already called bind_or_reset and missed the cache; hold it
+            # here so B's whole rebind+count lands before A's put.
+            a_is_counting.set()
+            assert b_has_rebound.wait(timeout=10), "B never rebound"
+
+        a = _GatedTokenizer(per_message=7, before_count=_pause_a)
+        b = _GatedTokenizer(per_message=31)
+        memo = TokenCountMemo()
+
+        a_total: list[int] = []
+        a_thread = threading.Thread(
+            target=lambda: a_total.append(count_messages_memoized(memo, a, messages)),
+            daemon=True,
+        )
+        a_thread.start()
+        assert a_is_counting.wait(timeout=10), "A never started counting"
+
+        # B rebinds (clearing A's era) and populates its own count.
+        b_total = count_messages_memoized(memo, b, messages)
+        b_has_rebound.set()
+        a_thread.join(timeout=10)
+        assert not a_thread.is_alive()
+
+        # A's own total stays exact under tokenizer A — the fix degrades A to
+        # uncached counting, it does not hand A B's numbers.
+        assert a_total == [7]
+        assert b_total == 31
+
+        # The proof: A's post-rebind put was dropped, so the memo still holds
+        # only B's count for the shared message and a fresh B read agrees.
+        assert memo.get(key, canonical, tokenizer=b) == 31
+        assert count_messages_memoized(memo, b, messages) == 31
+
+    def test_get_from_obsolete_binding_misses_instead_of_reading_new_counts(self) -> None:
+        """Mirror direction: a stale binding must not read the rebinder's
+        counts either (the swap guarantee stays symmetric)."""
+        messages = [{"role": "user", "content": "shared prefix message"}]
+        key = TokenCountMemo.message_hash(messages[0])
+        canonical = TokenCountMemo.canonical_message(messages[0])
+
+        a = _GatedTokenizer(per_message=7)
+        b = _GatedTokenizer(per_message=31)
+        memo = TokenCountMemo()
+
+        count_messages_memoized(memo, a, messages)
+        count_messages_memoized(memo, b, messages)  # rebinds to b
+
+        assert memo.get(key, canonical, tokenizer=a) is None
+        assert memo.get(key, canonical, tokenizer=b) == 31
