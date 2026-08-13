@@ -58,8 +58,10 @@ class CCRToolResult:
     content: str
     success: bool
     items_retrieved: int = 0
-    tokens_retrieved: int = 0
     tool_name: str | None = None
+    # Keep new optional fields after the established positional constructor
+    # parameters. Some integrations still pass ``tool_name`` positionally.
+    tokens_retrieved: int = 0
 
 
 @dataclass
