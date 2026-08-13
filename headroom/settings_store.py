@@ -1076,7 +1076,11 @@ SETTINGS: tuple[SettingField, ...] = (
         "Compression",
         "bool",
         default=False,
-        help="Enable ast-grep tool_result interceptors (Read outliner, etc.); mirrors --intercept-tool-results.",
+        help=(
+            "Enable ast-grep tool_result interceptors (Read outliner, etc.); mirrors "
+            "--intercept-tool-results. Rollout-gated: also needs "
+            "HEADROOM_ROLLOUT_CHANNEL=canary (or higher), else it stays off."
+        ),
         tier="advanced",
     ),
     # CCR & Caching page

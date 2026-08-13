@@ -9,6 +9,7 @@ import click
 
 from headroom import paths as _paths
 from headroom.providers.install_registry import build_install_target_envs
+from headroom.rollout import RolloutChannel
 
 from .models import (
     ConfigScope,
@@ -169,6 +170,26 @@ def build_manifest(
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:
         base_env.update(extra_env)
+    if intercept_tool_results:
+        configured_channel = base_env.get("HEADROOM_ROLLOUT_CHANNEL")
+        if configured_channel is None:
+            # The flag is an explicit canary opt-in. Persist the matching
+            # channel so the generated service can actually start.
+            base_env["HEADROOM_ROLLOUT_CHANNEL"] = RolloutChannel.CANARY.value
+        else:
+            channel = RolloutChannel.parse(configured_channel)
+            unsafe = base_env.get("HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "enabled",
+            }
+            if not channel.allows(RolloutChannel.CANARY) and not unsafe:
+                raise click.ClickException(
+                    "--intercept-tool-results requires HEADROOM_ROLLOUT_CHANNEL=canary "
+                    "(or dev), unless the unsafe rollout override is explicitly enabled"
+                )
 
     proxy_args = [
         "--host",

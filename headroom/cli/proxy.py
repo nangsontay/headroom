@@ -258,7 +258,7 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
-        "Off by default while this feature ships."
+        "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
@@ -641,7 +641,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
         "out of the provider prefix cache and compress them once their "
-        "file quiesces (env: HEADROOM_READ_MATURATION=1)"
+        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
+        "env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1080,12 +1081,46 @@ def proxy(
             err=True,
         )
 
+    # Resolve rollout inputs once before constructing any rollout-managed
+    # behavior. The immutable snapshot is injected into ProxyConfig and is also
+    # what /stats later exposes.
+    from headroom.rollout import resolve_rollout
+
+    rollout_requests = []
+    if intercept_tool_results:
+        rollout_requests.append("tool_result_interceptors")
+    if read_maturation:
+        rollout_requests.append("read_maturation")
+    rollout_snapshot = resolve_rollout(os.environ, requested=rollout_requests)
+
+    if read_maturation and not rollout_snapshot.is_enabled("read_maturation"):
+        click.secho(
+            "error: --read-maturation is not available in the current rollout channel "
+            f"({rollout_snapshot.channel.value}). Set HEADROOM_ROLLOUT_CHANNEL=beta "
+            "(or dev), or use HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for an "
+            "emergency override.",
+            fg="red",
+            err=True,
+        )
+        sys.exit(1)
+
     # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
     # Only fetch the bundled CLI tool binaries when the feature is enabled —
     # otherwise we'd pay a network round-trip and risk a readonly-FS failure
     # for capabilities the user hasn't asked for. The TransformPipeline reads
-    # this env var at construction time.
+    # the resolved snapshot says it is active.
     if intercept_tool_results:
+        if not rollout_snapshot.is_enabled("tool_result_interceptors"):
+            click.secho(
+                "error: --intercept-tool-results is not available in the current "
+                f"rollout channel ({rollout_snapshot.channel.value}). Set "
+                "HEADROOM_ROLLOUT_CHANNEL=canary to dogfood it, or use "
+                "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for emergency override.",
+                fg="red",
+                err=True,
+            )
+            sys.exit(1)
+
         from headroom.binaries import ensure_tools
 
         resolved_tools = ensure_tools()
@@ -1103,7 +1138,6 @@ def proxy(
                 err=True,
             )
             sys.exit(1)
-        os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
     try:
         resolved_anthropic_extra_headers = resolve_extra_headers(
@@ -1185,6 +1219,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,
@@ -1294,7 +1329,7 @@ def proxy(
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
         # Read maturation (Mechanism B): experimental, OFF by default
-        read_maturation=read_maturation,
+        read_maturation=rollout_snapshot.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=read_maturation_quiesce_turns,
         read_maturation_max_hold_turns=read_maturation_max_hold_turns,
         read_maturation_min_size_bytes=read_maturation_min_size_bytes,
