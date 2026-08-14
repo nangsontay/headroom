@@ -201,9 +201,10 @@ class RequestOutcome:
     from_response_cache: bool = False
 
     # Upstream HTTP status for this request (200 on success or response-cache
-    # hit). When >= 500 (e.g. a 529 Overloaded returned after retry
-    # exhaustion) the funnel records a failed request instead of feeding the
-    # savings/cost stats, so an upstream failure can't inflate save-rate.
+    # hit). When >= 400 (a 429 rate limit, or a 529 Overloaded returned after
+    # retry exhaustion) the funnel records the request as rate-limited/failed
+    # instead of feeding the savings/cost stats, so a turn the provider never
+    # billed can't inflate save-rate.
     status_code: int = 200
 
     # ── Timing ────────────────────────────────────────────────────────
@@ -507,12 +508,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
 
     # Consume (read + clear) any pending CCR proactive-expansion drawback for
     # this request now, but only RECORD it in the success section below -- a
-    # >=500 short-circuit must never book a retrieval that was never billed.
+    # >=400 short-circuit must never book a retrieval that was never billed.
     _pending_proactive = consume_pending_proactive_retrieval()
 
     # Consume (read + clear) the dropped CCR continuation rounds' usage for this
     # request. Folded into the cost view only in the success section below —
-    # a >=500 short-circuit must never book continuation tokens that, by the
+    # a >=400 short-circuit must never book continuation tokens that, by the
     # account-after-success rule in handle_response, were never billed.
     _pending_continuation = consume_pending_ccr_continuation_usage()
 
@@ -556,7 +557,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             await handler.metrics.record_failed(provider=outcome.provider)
         return
 
-    # Success section (status < 500, no exception): book the CCR proactive-
+    # Success section (status < 400, no exception): book the CCR proactive-
     # expansion drawback now, gated exactly like the gross tokens_saved below,
     # mirroring the reactive account-after-the-continuation-succeeds rule.
     if _pending_proactive is not None:
