@@ -1,10 +1,15 @@
 """A buffered-CCR turn is a billed call and its usage must reach accounting.
 
-When a ``stream:true`` request carries the ``headroom_retrieve`` tool, the
-Anthropic handler rewrites it to ``stream:false`` upstream so it can resolve
-retrievals server-side, then re-synthesizes SSE for the client. That buffered
-response carries the same ``usage`` block any non-stream reply does, so the
-provider's cache-read / cache-write / output counts must land on the outcome.
+When a ``stream:true`` request carries the ``headroom_retrieve`` tool AND a
+marker that retrieval can actually expand, the Anthropic handler rewrites it to
+``stream:false`` upstream so it can resolve retrievals server-side, then
+re-synthesizes SSE for the client. That buffered response carries the same
+``usage`` block any non-stream reply does, so the provider's cache-read /
+cache-write / output counts must land on the outcome.
+
+The marker is load-bearing, not decoration: a resident tool with nothing
+redeemable in the body keeps the plain streaming path, so a test that wants the
+buffered path has to earn it with a real store entry.
 
 If they don't, every cached token on the dominant Claude Code path is invisible:
 ``metrics.cache_by_provider`` only records a provider row when cache read or
@@ -54,6 +59,25 @@ _RETRIEVE_TOOL = {
 }
 
 
+def _redeemable_marker_content(text: str = "hi") -> str:
+    """User content carrying a marker this proxy really owns.
+
+    ``headroom_retrieve`` exists to expand a ``<<ccr:...>>`` marker, so the
+    buffered path declines a request that carries none — the tool alone is not
+    enough. Seed a store entry and reference its hash so retrieval has
+    something to redeem.
+    """
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    reset_compression_store()
+    hash_key = get_compression_store().store(
+        original="earlier tool output",
+        compressed="{}",
+        original_item_count=1,
+    )
+    return f"{text} (earlier output at <<ccr:{hash_key}>>)"
+
+
 def _app_and_outcomes(monkeypatch, **overrides):
     """App with a spy on the outcome record — where billed counts land."""
     kwargs: dict[str, Any] = {
@@ -75,11 +99,11 @@ def _app_and_outcomes(monkeypatch, **overrides):
     return app, outcomes
 
 
-def _post(app, *, stream: bool, tools: list[dict] | None):
+def _post(app, *, stream: bool, tools: list[dict] | None, content: str = "hi"):
     body: dict[str, Any] = {
         "model": "claude-opus-5",
         "max_tokens": 256,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": content}],
     }
     if stream:
         body["stream"] = True
@@ -115,7 +139,7 @@ def test_buffered_ccr_turn_records_provider_usage(monkeypatch) -> None:
         return_value=httpx.Response(200, json=_RESPONSE)
     )
 
-    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL])
+    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], content=_redeemable_marker_content())
 
     assert r.status_code == 200
     # The handler must have buffered it: upstream saw stream:false.
@@ -143,7 +167,7 @@ def test_buffered_ccr_records_usage_with_compression_on(monkeypatch) -> None:
         return_value=httpx.Response(200, json=_RESPONSE)
     )
 
-    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL])
+    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], content=_redeemable_marker_content())
 
     assert r.status_code == 200
     assert outcomes, "an outcome must be recorded"

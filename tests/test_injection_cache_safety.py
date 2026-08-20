@@ -44,6 +44,15 @@ from headroom.proxy.helpers import (
 
 CTX = "MEMORY CONTEXT"
 
+# Last turn's client bytes, and what was actually forwarded for them. The
+# forwarded form has to stay SMALLER than the original: overlay_cached_prefix()
+# declines an inflating candidate, and a replay is the precondition each guard
+# case below rests on. That bound also matches the real shape — the forwarded
+# prefix is the COMPRESSED message plus the injected segment, so it lands well
+# under the client's original.
+ORIGINAL_TURN = "hello " + "detail " * 40
+FORWARDED_TURN = f"hello [compressed]\n\n{CTX}"
+
 
 def _tracker_with_forwarded_turn(
     forwarded: list[dict[str, object]],
@@ -138,8 +147,8 @@ def test_guard_is_noop_when_append_helper_has_no_target() -> None:
 def test_guard_covers_block_append_merge_shape() -> None:
     """(a) The overlay's block-append merge replays last turn's blocks and
     appends this turn's after them; that position must still be guarded."""
-    turn1_orig = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
-    turn1_fwd = [{"role": "user", "content": [{"type": "text", "text": f"hello\n\n{CTX}"}]}]
+    turn1_orig = [{"role": "user", "content": [{"type": "text", "text": ORIGINAL_TURN}]}]
+    turn1_fwd = [{"role": "user", "content": [{"type": "text", "text": FORWARDED_TURN}]}]
     tracker = _tracker_with_forwarded_turn(turn1_fwd, turn1_orig)
 
     # Same message, one appended block (Claude Code's tool_result growth shape).
@@ -147,7 +156,7 @@ def test_guard_covers_block_append_merge_shape() -> None:
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "hello"},
+                {"type": "text", "text": ORIGINAL_TURN},
                 {"type": "text", "text": "and one more thing"},
             ],
         }
@@ -171,8 +180,8 @@ def test_guard_covers_block_append_merge_shape() -> None:
 def test_anthropic_assistant_prefill_does_not_reinject_into_earlier_user_turn() -> None:
     """(a) Anthropic, assistant-prefill tail: the append helper has no live-zone
     target, so already-injected user content is never appended to twice."""
-    turn1_orig = [{"role": "user", "content": "hello"}]
-    turn1_fwd = [{"role": "user", "content": f"hello\n\n{CTX}"}]
+    turn1_orig = [{"role": "user", "content": ORIGINAL_TURN}]
+    turn1_fwd = [{"role": "user", "content": FORWARDED_TURN}]
     tracker = _tracker_with_forwarded_turn(turn1_fwd, turn1_orig)
 
     # Append-only next turn whose newest message is an assistant prefill.
@@ -200,8 +209,8 @@ def test_anthropic_assistant_prefill_does_not_reinject_into_earlier_user_turn() 
 def test_openai_non_user_tail_blocks_reinjection_into_replayed_user_message() -> None:
     """(a) OpenAI, non-user tail: the append target is an EARLIER user message
     that the overlay already replayed, so the guard must fire."""
-    turn1_orig = [{"role": "user", "content": "hello"}]
-    turn1_fwd = [{"role": "user", "content": f"hello\n\n{CTX}"}]
+    turn1_orig = [{"role": "user", "content": ORIGINAL_TURN}]
+    turn1_fwd = [{"role": "user", "content": FORWARDED_TURN}]
     tracker = _tracker_with_forwarded_turn(turn1_fwd, turn1_orig)
 
     # Append-only next turn ending on a tool result (newest message is not user).
@@ -227,8 +236,8 @@ def test_openai_non_user_tail_blocks_reinjection_into_replayed_user_message() ->
 def test_openai_fresh_user_tail_after_non_user_history_still_injects() -> None:
     """(a) The guard must not over-block: a genuinely new user turn behind the
     same already-injected history still receives injection."""
-    turn1_orig = [{"role": "user", "content": "hello"}]
-    turn1_fwd = [{"role": "user", "content": f"hello\n\n{CTX}"}]
+    turn1_orig = [{"role": "user", "content": ORIGINAL_TURN}]
+    turn1_fwd = [{"role": "user", "content": FORWARDED_TURN}]
     tracker = _tracker_with_forwarded_turn(turn1_fwd, turn1_orig)
 
     turn2_orig = [

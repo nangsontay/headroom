@@ -530,5 +530,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
         return await proxy.handle_passthrough(
             request,
-            _select_passthrough_base_url(proxy, dict(request.headers)),
+            # The path matters here: this is where unrouted paths land, and
+            # Copilot's inline completions are one of them (#3076).
+            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
         )

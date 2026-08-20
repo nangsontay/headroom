@@ -6,8 +6,60 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    import tomli as tomllib  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> None:
+    """Every image that advertises ``--backend bedrock`` must ship botocore.
+
+    Temporary AWS credentials take LiteLLM's botocore-backed authentication
+    path.  The default images previously installed only ``proxy``/``code``, so
+    the documented Docker Bedrock command failed at runtime with
+    ``No module named 'botocore'`` (#1551).  Keep the standalone Dockerfile and
+    every bake target on the existing ``bedrock`` package extra.
+    """
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG HEADROOM_EXTRAS=proxy,code,bedrock" in dockerfile
+
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    extras_lines = [
+        line.strip() for line in bake.splitlines() if line.strip().startswith("HEADROOM_EXTRAS =")
+    ]
+    assert len(extras_lines) == 9
+    assert all("bedrock" in line for line in extras_lines), extras_lines
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    bedrock_names = {
+        Requirement(requirement).name
+        for requirement in project["project"]["optional-dependencies"]["bedrock"]
+    }
+    assert {"boto3", "botocore"} <= bedrock_names
+
+
+def test_public_docker_instructions_use_the_current_organization_package() -> None:
+    """Do not send users back to the personal GHCR package frozen at 0.27.0."""
+    public_docs = (
+        "README.md",
+        "llms.txt",
+        "docker-compose.yml",
+        "TESTING-copilot-subscription.md",
+        "wiki/cli.md",
+        "wiki/docker-install.md",
+    )
+    deprecated = "ghcr.io/chopratejas/headroom"
+    current = "ghcr.io/headroomlabs-ai/headroom"
+
+    for relative_path in public_docs:
+        content = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert deprecated not in content, relative_path
+        assert current in content, relative_path
 
 
 def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
@@ -1415,3 +1467,69 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "server.json",
     ]:
         assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
+
+
+def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -> None:
+    """The release credential must not be readable by the synced branch's code.
+
+    ``release-metadata-sync`` triggers on a push to the ``release-please--branches--**``
+    glob, which is not a protected namespace, and then runs
+    ``scripts/version-sync.py`` *from the checked-out branch*. With
+    ``actions/checkout``'s default ``persist-credentials: true`` the token is
+    written to ``.git/config`` before that script runs, so anyone able to push a
+    matching branch could read it. The credential reaches PyPI, npm and GHCR via
+    the ``release: published`` publishes, so this is not a theoretical leak.
+    """
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["sync"]["steps"]
+
+    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+    assert checkouts, "expected a checkout step"
+    for step in checkouts:
+        assert step.get("with", {}).get("persist-credentials") is False, step
+        # A token passed to checkout is exactly what persist-credentials would
+        # write to disk; the push step supplies it via env instead.
+        assert "token" not in step.get("with", {}), step
+
+
+@pytest.mark.parametrize(
+    "workflow_path,job",
+    [
+        (".github/workflows/release-please.yml", "release-please"),
+        (".github/workflows/release-metadata-sync.yml", "sync"),
+    ],
+)
+def test_release_workflows_prefer_scoped_app_token(workflow_path: str, job: str) -> None:
+    """A repo-scoped, short-lived app token must be preferred over the PAT.
+
+    The PAT carries a maintainer's entire account and bypasses branch and tag
+    protection (#2955). The app-token step is gated on ``vars.RELEASE_APP_ID``
+    and marked ``continue-on-error`` so an unconfigured app falls back to the
+    existing chain rather than blocking a release.
+    """
+    workflow = yaml.safe_load((ROOT / workflow_path).read_text(encoding="utf-8"))
+    steps = workflow["jobs"][job]["steps"]
+
+    minters = [
+        s for s in steps if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    ]
+    assert len(minters) == 1, steps
+    minter = minters[0]
+    assert minter["id"] == "app-token"
+    assert minter["continue-on-error"] is True
+    assert "vars.RELEASE_APP_ID" in str(minter["if"])
+
+    # Whatever consumes the credential must try the app token first.
+    consumers = [
+        value
+        for step in steps
+        for value in list(step.get("with", {}).values()) + list(step.get("env", {}).values())
+        if "RELEASE_PLEASE_TOKEN" in str(value)
+    ]
+    assert consumers, "expected a step consuming the release credential"
+    for value in consumers:
+        assert str(value).index("steps.app-token.outputs.token") < str(value).index(
+            "secrets.RELEASE_PLEASE_TOKEN"
+        ), value

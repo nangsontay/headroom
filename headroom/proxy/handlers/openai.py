@@ -28,6 +28,7 @@ from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     extract_tags,
     jitter_delay_ms,
+    sanitize_forwarded_response_headers,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
@@ -69,6 +70,11 @@ from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
     should_stamp_codex_client,
+)
+from headroom.proxy.buffered_ccr_response import (
+    DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+    OPENAI_ERROR_FORMAT,
+    buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
@@ -327,10 +333,10 @@ def _sanitize_forwarded_response_headers(
     headers: httpx.Headers | dict[str, str],
     *extra_names: str,
 ) -> dict[str, str]:
-    cleaned = dict(headers)
-    for name in ("content-encoding", "content-length", "server", *extra_names):
-        cleaned.pop(name, None)
-    return cleaned
+    # Thin alias kept for the many call sites in this module; the policy
+    # (and the list of framing headers) lives in one place so the Anthropic
+    # handler strips exactly the same set — see #3019.
+    return sanitize_forwarded_response_headers(headers, *extra_names)
 
 
 def _resolve_openai_handler_path(
@@ -763,36 +769,9 @@ def _compact_openai_responses_tools(
     return compact_tools(payload)
 
 
-def _responses_request_allows_memory_tool_continuation(payload: dict[str, Any]) -> bool:
-    """Return whether Responses memory tools may rely on stored continuations.
-
-    Headroom memory tools use ``previous_response_id`` continuations after a
-    tool call. Those continuations require the originating response to be
-    stored. When a client explicitly sends ``store=false``, preserve that
-    contract and skip the Responses memory-tool injection path instead of
-    mutating the request.
-    """
-
-    return payload.get("store") is not False
-
-
-def _ensure_responses_store_for_memory_tools(
-    payload: dict[str, Any],
-    *,
-    memory_tools_injected: bool,
-) -> bool:
-    """Return True when memory-tool injection requires and receives store=true."""
-
-    if memory_tools_injected and payload.get("store") is not True:
-        payload["store"] = True
-        return True
-    return False
-
-
 def _allow_responses_memory_tools(is_chatgpt_auth: bool) -> bool:
-    # ChatGPT Codex rejects Responses payloads unless store=false. The
-    # transparent memory-tool continuation flow needs stored responses, so keep
-    # it on the regular API path only.
+    # Preserve the ChatGPT Codex route's existing store policy and memory-tool
+    # exclusion while API Responses memory continuations stay stateless.
     return not is_chatgpt_auth
 
 
@@ -1047,6 +1026,23 @@ def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _responses_stateless_output_items(output_items: Any) -> list[dict[str, Any]]:
+    """Return response items that can be replayed without provider state."""
+    if not isinstance(output_items, list):
+        return []
+    return [
+        item
+        for item in output_items
+        if isinstance(item, dict)
+        and not (item.get("type") == "reasoning" and not item.get("encrypted_content"))
+    ]
+
+
+def _responses_stateless_input_items(input_data: Any) -> list[dict[str, Any]]:
+    """Normalize input and remove reasoning items without encrypted content."""
+    return _responses_stateless_output_items(_responses_input_to_items(input_data))
+
+
 def _dedup_responses_output_items(
     items: list[dict[str, Any]],
     output_types: frozenset[str],
@@ -1180,6 +1176,47 @@ def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
     _emit("response.completed", {"response": response})
     events.append(b"data: [DONE]\n\n")
     return events
+
+
+def _openai_responses_from_sse(sse_text: str) -> dict[str, Any] | None:
+    """Reassemble the final Responses API JSON body from an SSE stream.
+
+    Inverse of ``_openai_responses_to_sse``, for upstreams that answer a
+    ``stream: false`` request with a valid ``200 text/event-stream`` body
+    (#2613). The terminal ``response.completed`` event carries the complete
+    response object, so no delta accumulation is needed. Returns ``None``
+    when no terminal event is present — the caller forwards the raw body
+    unchanged in that case.
+    """
+    completed: dict[str, Any] | None = None
+    data_lines: list[str] = []
+
+    def _consume(lines: list[str]) -> None:
+        nonlocal completed
+        if not lines:
+            return
+        data_str = "\n".join(lines)
+        if data_str == "[DONE]":
+            return
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return
+        if isinstance(data, dict) and data.get("type") == "response.completed":
+            response = data.get("response")
+            if isinstance(response, dict):
+                completed = response
+
+    for raw_line in sse_text.split("\n"):
+        line = raw_line.rstrip("\r")
+        if not line:
+            _consume(data_lines)
+            data_lines = []
+        elif line.startswith("data:"):
+            # Per the SSE spec, strip at most one leading space after the colon.
+            data_lines.append(line[5:].removeprefix(" "))
+    _consume(data_lines)
+    return completed
 
 
 def _output_shaping_holdout_fraction() -> float:
@@ -2437,6 +2474,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         client: str | None = None,
+        savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2583,6 +2621,23 @@ class OpenAIHandlerMixin:
             working["tools"] = _deferred_tools
             modified = True
             transforms.append("openai:responses:tool_search_deferral")
+            try:
+                from headroom.proxy.savings_attribution import record_savings
+
+                deferred = [
+                    tool
+                    for tool in _deferred_tools
+                    if isinstance(tool, dict) and tool.get("defer_loading")
+                ]
+                record_savings(
+                    savings_tags if savings_tags is not None else {},
+                    "tool_search",
+                    tokens=self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(deferred)
+                    ),
+                )
+            except Exception:
+                logger.debug("tool-search savings attribution skipped", exc_info=True)
 
         # Turn hooks (opt-in extensions): a registered hook may inspect or rewrite
         # the outbound tools before we send — the extensible counterpart to the
@@ -2621,6 +2676,17 @@ class OpenAIHandlerMixin:
                 messages=_msgs_before,
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
+                tags=savings_tags if savings_tags is not None else {},
+                count_messages=lambda value: self.openai_provider.get_token_counter(
+                    model
+                ).count_text(_json_debug_dumps(value)),
+                count_tools=lambda value: (
+                    self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(value)
+                    )
+                    if value
+                    else 0
+                ),
             )
             # Streaming turns get fold-only hooks, same rule as the
             # chat-completions path. A hook that defers work to `on_response`
@@ -2791,6 +2857,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
+        savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2820,6 +2887,8 @@ class OpenAIHandlerMixin:
                 "timing": timing,
                 "client": client,
             }
+            if savings_tags is not None:
+                compression_kwargs["savings_tags"] = savings_tags
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -2831,7 +2900,7 @@ class OpenAIHandlerMixin:
                     unsupported_kwarg = next(
                         (
                             name
-                            for name in ("client", "timing")
+                            for name in ("savings_tags", "client", "timing")
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
                         ),
@@ -3035,6 +3104,9 @@ class OpenAIHandlerMixin:
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         client = classify_client(headers)
         # Surface the image-compression decision (computed earlier) into
         # tags now that the tags dict exists. Same observability pattern
@@ -3053,7 +3125,14 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_chat = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # `custom_upstream_base_url` is the per-request `x-headroom-base-url`
+        # override resolved above. Secrets only go to designated hosts.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers,
+            upstream_url=custom_upstream_base_url,
+            config=self.config,
+        )
         log_outbound_headers(
             forwarder="openai_chat_completions",
             stripped_count=_pre_strip_count_chat,
@@ -3207,10 +3286,34 @@ class OpenAIHandlerMixin:
                     )
                 )
 
-                # Remove compression headers from cached response
-                response_headers = _sanitize_forwarded_response_headers(cached.response_headers)
+                # Strip the stored response's wire-framing headers, and its
+                # content-type: the entry carries whatever the *producing*
+                # upstream sent, and replaying that framing over a different
+                # connection breaks the body — a stale
+                # ``transfer-encoding: chunked`` makes the client parse plain
+                # JSON as chunked frames and read nothing out of an HTTP 200
+                # (#3019, same reasoning as #2952 on the Anthropic twin).
+                response_headers = _sanitize_forwarded_response_headers(
+                    cached.response_headers,
+                    "content-type",
+                )
 
-                return Response(content=cached.response_body, headers=response_headers)
+                # A cache hit answers without touching the upstream, so it
+                # emits no outbound_request line and no upstream stage
+                # timings. Log it, or a served-from-cache turn looks exactly
+                # like a turn that died silently (#3019).
+                logger.info(
+                    f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                    f"bytes={len(cached.response_body)} "
+                    f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
+                    f"hits={cached.hit_count}"
+                )
+
+                return Response(
+                    content=cached.response_body,
+                    headers=response_headers,
+                    media_type="application/json",
+                )
 
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
@@ -3562,6 +3665,10 @@ class OpenAIHandlerMixin:
                 ),
             )
             injector.scan_for_markers(optimized_messages)
+            # Shape-only scanning also matches markers from other context
+            # tools; drop hashes this proxy never actually stored before
+            # they can drive tool injection (issue #2836).
+            injector.verify_ownership()
             if (
                 self.config.ccr_inject_system_instructions
                 and not stream
@@ -3573,6 +3680,7 @@ class OpenAIHandlerMixin:
                 from headroom.proxy.helpers import (
                     apply_session_sticky_ccr_tool,
                     has_new_ccr_markers,
+                    history_references_ccr_tool,
                 )
 
                 # #1850: markers replayed from overlay_cached_prefix are
@@ -3591,6 +3699,7 @@ class OpenAIHandlerMixin:
                     request_id=request_id,
                     existing_tools=tools,
                     has_compressed_content_this_turn=has_new_compressed_content,
+                    history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                 )
                 if ccr_tool_injected:
                     logger.debug(
@@ -3915,6 +4024,7 @@ class OpenAIHandlerMixin:
             run_request_hooks,
         )
 
+        _th_ctx: TurnContext | None = None
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
@@ -3928,6 +4038,11 @@ class OpenAIHandlerMixin:
                 messages=body["messages"],
                 tools=_th_tools_before,
                 config=self.config,
+                tags=tags,
+                count_messages=tokenizer.count_messages,
+                count_tools=lambda value: (
+                    tokenizer.count_text(json.dumps(value, default=str)) if value else 0
+                ),
             )
             # Snapshot messages BEFORE the hook (same tokenizer) so we can tell whether
             # the hook itself folded — comparing against optimized_tokens instead
@@ -4457,12 +4572,13 @@ class OpenAIHandlerMixin:
                         # replaces the response, this original is the one nobody
                         # else will read.
                         _hook_usage.record(_hook_resp_json, **CHAT_USAGE_KEYS)
-                        _hook_ctx = _TurnContext(
+                        _hook_ctx = _th_ctx or _TurnContext(
                             provider="openai",
                             model=str(model),
                             messages=body["messages"],
                             tools=body.get("tools"),
                             config=self.config,
+                            tags=tags,
                         )
 
                         async def _hook_call_model(_msgs):
@@ -4753,7 +4869,16 @@ class OpenAIHandlerMixin:
                 # Cache response under the SAME key it was looked up by:
                 # cache_lookup_messages is the raw pre-mutation snapshot, not
                 # the live (hooked) `messages` (#327).
-                if self.cache and response.status_code == 200:
+                #
+                # ``not stream`` mirrors the read gate at the cache lookup
+                # above. It is currently redundant here — a streaming chat
+                # request returns via ``_stream_response`` well before this
+                # point — but the Anthropic handler had the same shape until a
+                # buffered-CCR branch started falling through to its store
+                # site, which let a response built for a stream:true request
+                # answer a later non-streaming caller (#3019). Stating the
+                # invariant keeps that from being reintroduced silently.
+                if self.cache and not stream and response.status_code == 200:
                     await self.cache.set(
                         cache_lookup_messages,
                         model,
@@ -5001,6 +5126,9 @@ class OpenAIHandlerMixin:
         # to decompress already-decoded JSON and reject it with HTTP 400 (#1542).
         headers.pop("content-encoding", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         client = classify_client(headers)
 
         # Learn from the original client payload before memory context or
@@ -5018,7 +5146,15 @@ class OpenAIHandlerMixin:
 
         _pre_strip_count_resp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
-        headers = merge_extra_headers(headers, self.config.openai_extra_headers)
+        # This handler also honors `x-headroom-base-url` (resolved further
+        # below); resolve it here too so the secret headers are gated on the
+        # real destination rather than merged before it is known.
+        headers = merge_extra_headers(
+            headers,
+            self.config.openai_extra_headers,
+            upstream_url=_resolve_openai_upstream_base(request.headers),
+            config=self.config,
+        )
         # Mirror the WS handler: never forward Codex's client-only lite header
         # upstream. OpenAI rejects newer Codex models when it leaks, and the HTTP
         # POST path (unlike the WS path) otherwise forwards request headers verbatim.
@@ -5277,10 +5413,7 @@ class OpenAIHandlerMixin:
                     else:
                         memory_tool_defs_responses.append(t)
 
-                if (
-                    responses_memory_tools_allowed
-                    and _responses_request_allows_memory_tool_continuation(body)
-                ):
+                if responses_memory_tools_allowed:
                     resp_tools = body.get("tools") or []
                     resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
                         provider="openai",
@@ -5292,23 +5425,16 @@ class OpenAIHandlerMixin:
                     )
                     if mem_tools_injected:
                         body["tools"] = resp_tools
+                        include = body.get("include")
+                        if isinstance(include, list):
+                            if "reasoning.encrypted_content" not in include:
+                                body["include"] = [*include, "reasoning.encrypted_content"]
+                        elif include is None:
+                            body["include"] = ["reasoning.encrypted_content"]
                         body_mutation_tracker.mark_mutated("responses_memory_tools")
                         logger.info(
                             f"[{request_id}] Memory: Injected memory tools (openai/responses)"
                         )
-                        if _ensure_responses_store_for_memory_tools(
-                            body,
-                            memory_tools_injected=True,
-                        ):
-                            body_mutation_tracker.mark_mutated("responses_memory_store")
-                            logger.info(
-                                f"[{request_id}] Memory: forced store=true for Responses memory tool continuation"
-                            )
-                elif self.memory_handler.config.inject_tools:
-                    logger.info(
-                        "[%s] Memory: skipped Responses memory tools because client set store=false",
-                        request_id,
-                    )
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
         elif self.memory_handler and memory_user_id and _bypass:
@@ -5365,6 +5491,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     request_id=request_id,
                     client=client,
+                    savings_tags=tags,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -5528,6 +5655,12 @@ class OpenAIHandlerMixin:
             if body.get("stream") is not False:
                 body["stream"] = False
                 body_mutation_tracker.mark_mutated("ccr_streaming_retrieve_buffered_non_stream")
+            # Same contradiction as the Anthropic path: the body now asks for a
+            # non-streaming reply while the client's Accept still says SSE. This
+            # handler serves GitHub Copilot (see apply_copilot_api_auth below),
+            # whose gateway is one of the strict ones (#3078).
+            _accept_key = next((k for k in headers if k.lower() == "accept"), "accept")
+            headers[_accept_key] = "application/json"
             logger.info(
                 f"[{request_id}] CCR: stream:true /v1/responses request has "
                 "headroom_retrieve available; using buffered stream:false "
@@ -5636,6 +5769,7 @@ class OpenAIHandlerMixin:
                                 messages=body.get(_resp_key) or [],
                                 tools=body.get("tools"),
                                 config=self.config,
+                                tags=tags,
                             )
 
                             async def _resp_hook_call_model(
@@ -5696,9 +5830,49 @@ class OpenAIHandlerMixin:
 
                     total_latency = (time.time() - start_time) * 1000
 
+                    # Some OpenAI-compatible upstreams answer a ``stream: false``
+                    # request with a valid 200 SSE body carrying Responses API
+                    # events (#2613). Reassemble the terminal response JSON so
+                    # the buffered path keeps working — previously
+                    # ``response.json()`` raised JSONDecodeError past the
+                    # narrow usage-extraction catch below and the successful
+                    # upstream reply surfaced as a 502 proxy_error.
+                    upstream_content_type = response.headers.get("content-type", "")
+                    if (
+                        response.status_code == 200
+                        and "text/event-stream" in upstream_content_type.lower()
+                    ):
+                        completed_json = _openai_responses_from_sse(response.text)
+                        if completed_json is None:
+                            # No terminal event to adapt — forward the
+                            # successful upstream body unchanged rather than
+                            # fabricating a 502.
+                            return Response(
+                                content=response.content,
+                                status_code=response.status_code,
+                                headers=_sanitize_forwarded_response_headers(response.headers),
+                            )
+                        adapted_headers = {
+                            k: v
+                            for k, v in response.headers.items()
+                            if k.lower()
+                            not in (
+                                "content-type",
+                                "content-length",
+                                "content-encoding",
+                                "transfer-encoding",
+                            )
+                        }
+                        response = httpx.Response(
+                            status_code=response.status_code,
+                            content=json.dumps(completed_json).encode(),
+                            headers={**adapted_headers, "content-type": "application/json"},
+                        )
+
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
                     cache_read_tokens = 0
+                    resp_json = None
                     try:
                         resp_json = response.json()
                         usage = resp_json.get("usage", {})
@@ -5717,7 +5891,13 @@ class OpenAIHandlerMixin:
                         details = usage.get("input_tokens_details")
                         if isinstance(details, dict):
                             cache_read_tokens = _usage_int(details.get("cached_tokens"))
-                    except (KeyError, TypeError, AttributeError) as e:
+                    except (
+                        json.JSONDecodeError,
+                        ValueError,
+                        KeyError,
+                        TypeError,
+                        AttributeError,
+                    ) as e:
                         logger.debug(
                             f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
                         )
@@ -5915,17 +6095,17 @@ class OpenAIHandlerMixin:
                                 )
 
                             if tool_outputs:
-                                # Make continuation request with tool results
-                                response_id = resp_json.get("id")
+                                # Make a stateless continuation with the complete
+                                # item history instead of relying on retained state.
                                 continuation_body = {
-                                    "model": model,
-                                    "input": tool_outputs,
+                                    **body,
+                                    "input": [
+                                        *_responses_stateless_input_items(body.get("input")),
+                                        *_responses_stateless_output_items(output_items),
+                                        *tool_outputs,
+                                    ],
                                 }
-                                if response_id:
-                                    continuation_body["previous_response_id"] = response_id
-                                existing_tools = body.get("tools")
-                                if existing_tools:
-                                    continuation_body["tools"] = existing_tools
+                                continuation_body.pop("previous_response_id", None)
 
                                 cont_response = await self._retry_request(
                                     "POST", url, headers, continuation_body
@@ -6063,6 +6243,25 @@ class OpenAIHandlerMixin:
                             headers=sse_headers,
                         )
 
+                    if buffered_stream_ccr and response.status_code == 200 and not resp_json:
+                        logger.warning(
+                            f"[{request_id}] CCR: rejecting malformed buffered Responses 200 "
+                            f"reply (content-type={response.headers.get('content-type')!r}, "
+                            f"body_bytes={len(response.content)})"
+                        )
+                        return Response(
+                            content=json.dumps(
+                                {
+                                    "error": {
+                                        "type": "upstream_protocol_error",
+                                        "message": "Upstream returned an invalid buffered response.",
+                                    }
+                                }
+                            ),
+                            status_code=502,
+                            media_type="application/json",
+                        )
+
                     # Inline marker resolution, non-streaming only. Runs
                     # outside the has_ccr_tool_calls gate above on purpose:
                     # the #2509 case has no retrieve tool call at all.
@@ -6086,58 +6285,24 @@ class OpenAIHandlerMixin:
 
             if buffered_stream_ccr:
                 operation = asyncio.create_task(_buffered_ccr_operation())
-                record_failed = self.metrics.record_failed
+
+                # Same wrapper as the Anthropic twin; only the error wire format
+                # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
+                _buffered_call = buffered_ccr_asgi_call(
+                    operation=operation,
+                    fmt=OPENAI_ERROR_FORMAT,
+                    grace_seconds=getattr(
+                        self.config,
+                        "buffered_ccr_grace_seconds",
+                        DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
+                    ),
+                    record_failed=self.metrics.record_failed,
+                    request_id=request_id,
+                )
 
                 class _BufferedCCRResponse(Response):
                     async def __call__(self, scope, receive, send):  # noqa: ANN001
-                        # Send nothing until the buffered operation resolves —
-                        # see the AnthropicHandler twin for the full rationale.
-                        # Committing `200 text/event-stream` on a keepalive timer,
-                        # before the outcome is known, turns every non-200 or
-                        # unparseable upstream reply into a 200 with no usable
-                        # body and discards the status the client needs to back
-                        # off on.
-                        try:
-                            try:
-                                result = await operation
-                            except Exception as e:
-                                await record_failed(provider="openai")
-                                logger.error(
-                                    f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}"
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.start",
-                                        "status": 502,
-                                        "headers": [(b"content-type", b"application/json")],
-                                    }
-                                )
-                                await send(
-                                    {
-                                        "type": "http.response.body",
-                                        "body": json.dumps(
-                                            {
-                                                "error": {
-                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                    "type": "server_error",
-                                                    "code": "proxy_error",
-                                                }
-                                            }
-                                        ).encode(),
-                                        "more_body": False,
-                                    }
-                                )
-                                return
-                            await result(scope, receive, send)
-                        finally:
-                            if not operation.done():
-                                operation.cancel()
-                                try:
-                                    await operation
-                                except asyncio.CancelledError:
-                                    pass
-                                except Exception:
-                                    pass
+                        await _buffered_call(scope, receive, send)
 
                 return _BufferedCCRResponse(media_type="text/event-stream")
             return await _buffered_ccr_operation()
@@ -6505,8 +6670,13 @@ class OpenAIHandlerMixin:
             upstream: Any = None
             from headroom.proxy.helpers import merge_extra_headers
 
+            # The WS upstream is derived from config (chatgpt.com backend or
+            # OPENAI_API_URL), never from a request header.
             upstream_headers = merge_extra_headers(
-                upstream_headers, self.config.openai_extra_headers
+                upstream_headers,
+                self.config.openai_extra_headers,
+                upstream_url=None,
+                config=self.config,
             )
 
             for ws_attempt in range(ws_connect_attempts):
@@ -6682,6 +6852,8 @@ class OpenAIHandlerMixin:
                 return json.dumps(flattened, ensure_ascii=False)
 
             body: dict[str, Any] = {}
+            current_response_input: list[dict[str, Any]] = []
+            current_response_template: dict[str, Any] = {}
             tokens_saved = 0
             # Session-scoped accumulator for tokens we *attempted* to
             # compress (extracted units + schema). Drives the active-
@@ -6880,7 +7052,8 @@ class OpenAIHandlerMixin:
                 try:
                     # Unwrap response.create envelope to access the response body
                     ws_response_body = frame_body.get("response", frame_body)
-
+                    if not isinstance(ws_response_body, dict):
+                        return frame_raw
                     # Per-project memory routing (GH #462). For WS,
                     # ``ws_response_body`` carries ``instructions`` —
                     # that's the system-prompt-equivalent we feed to the
@@ -7026,6 +7199,15 @@ class OpenAIHandlerMixin:
                     )
                     if mem_injected:
                         ws_response_body["tools"] = ws_tools
+                        include = ws_response_body.get("include")
+                        if isinstance(include, list):
+                            if "reasoning.encrypted_content" not in include:
+                                ws_response_body["include"] = [
+                                    *include,
+                                    "reasoning.encrypted_content",
+                                ]
+                        elif include is None:
+                            ws_response_body["include"] = ["reasoning.encrypted_content"]
 
                         # Add memory instruction so the model uses
                         # memory tools as persistent cross-session knowledge.
@@ -7065,7 +7247,12 @@ class OpenAIHandlerMixin:
                 body.get("type") == "response.create" or ("type" not in body and "input" in body)
             ):
                 first_msg_raw = await _prepare_memory_frame(body, first_msg_raw)
-
+                first_response_body = body.get("response", body)
+                current_response_input = _responses_input_to_items(
+                    first_response_body.get("input")
+                    if isinstance(first_response_body, dict)
+                    else None
+                )
             # Hot-fix follow-up to PR #406 — inline Rust compression on the
             # WS first frame before forwarding upstream. PR #406 enabled
             # the same call for HTTP /v1/responses; PR-C5's "WS-side
@@ -7324,6 +7511,19 @@ class OpenAIHandlerMixin:
                     )
 
             first_msg_raw = _normalize_ws_response_create_for_upstream(first_msg_raw)
+            try:
+                final_first_body = json.loads(first_msg_raw)
+            except json.JSONDecodeError:
+                final_first_body = None
+            if isinstance(final_first_body, dict):
+                final_first_response = final_first_body.get("response", final_first_body)
+                if isinstance(final_first_response, dict):
+                    current_response_template = dict(final_first_response)
+                    current_response_template.pop("input", None)
+                    current_response_template.pop("previous_response_id", None)
+                    current_response_input = _responses_input_to_items(
+                        final_first_response.get("input")
+                    )
             _first_upstream_body: Any = None
             try:
                 _first_upstream_body = json.loads(first_msg_raw)
@@ -7662,6 +7862,8 @@ class OpenAIHandlerMixin:
                         nonlocal ws_client_frames_total, ws_cancel_frames
                         nonlocal ws_frames_compressed
                         nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
+                        nonlocal current_response_input
+                        nonlocal current_response_template
                         client_frame_index = 1
                         try:
                             while True:
@@ -7714,6 +7916,14 @@ class OpenAIHandlerMixin:
                                     and _inbound_frame_body.get("type") == "response.create"
                                 ):
                                     ws_response_create_frames += 1
+                                    inbound_response = _inbound_frame_body.get(
+                                        "response", _inbound_frame_body
+                                    )
+                                    current_response_input = _responses_input_to_items(
+                                        inbound_response.get("input")
+                                        if isinstance(inbound_response, dict)
+                                        else None
+                                    )
                                     msg = await _prepare_memory_frame(_inbound_frame_body, msg)
                                 (
                                     msg,
@@ -7758,6 +7968,27 @@ class OpenAIHandlerMixin:
                                         )
 
                                 msg = _normalize_ws_response_create_for_upstream(msg)
+                                if ws_last_client_frame_type == "response.create":
+                                    try:
+                                        outbound_body = json.loads(msg)
+                                        outbound_body = (
+                                            outbound_body.get("response", outbound_body)
+                                            if isinstance(outbound_body, dict)
+                                            else {}
+                                        )
+                                        if isinstance(outbound_body, dict):
+                                            current_response_template = dict(outbound_body)
+                                            current_response_template.pop("input", None)
+                                            current_response_template.pop(
+                                                "previous_response_id", None
+                                            )
+                                        candidate_input = _responses_input_to_items(
+                                            outbound_body.get("input")
+                                        )
+                                        if candidate_input:
+                                            current_response_input = candidate_input
+                                    except (json.JSONDecodeError, AttributeError, TypeError):
+                                        current_response_input = []
                                 _outbound_frame_body: Any = None
                                 try:
                                     _outbound_frame_body = json.loads(msg)
@@ -7814,10 +8045,11 @@ class OpenAIHandlerMixin:
                         """Relay upstream→client with transparent memory tool handling.
 
                         Uses a buffer-then-decide approach:
-                        1. Buffer events until first output item arrives
-                        2. If first output is a memory tool → suppress entire response,
-                           execute tools silently, send continuation upstream
-                        3. If first output is non-memory → flush buffer, stream normally
+                        1. Buffer events until the first non-reasoning output item arrives
+                        2. If a memory tool arrives, suppress the response and execute it
+                           silently before sending a stateless continuation upstream
+                        3. Flush ordinary output as soon as the response is known not to
+                           begin with a reasoning-only prelude
                         4. Continuation response events are relayed to Codex seamlessly
 
                         This prevents orphaned response.created events from confusing Codex.
@@ -7842,27 +8074,25 @@ class OpenAIHandlerMixin:
                         nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
                         nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
                         nonlocal ws_ttfb_ms
-
-                        memory_enabled = bool(
-                            self.memory_handler and memory_user_id and ws_memory_tools_allowed
-                        )
+                        nonlocal current_response_input
 
                         # Per-response state (reset after each response.completed)
                         event_buffer: list[str] = []
                         decided = False
                         suppress_response = False
                         pending_fcs: list[dict[str, Any]] = []
-                        resp_id: str | None = None
+                        response_output_items: list[dict[str, Any]] = []
 
                         def _reset() -> None:
-                            nonlocal decided, suppress_response, resp_id
+                            nonlocal decided, suppress_response
                             event_buffer.clear()
                             decided = False
                             suppress_response = False
                             pending_fcs.clear()
-                            resp_id = None
+                            response_output_items.clear()
 
                         response_started_ms: float | None = None
+                        completed_response_model = "unknown"
 
                         async def _record_ws_response_metrics() -> None:
                             """Record one completed Responses turn on long-lived WS sessions."""
@@ -7919,7 +8149,7 @@ class OpenAIHandlerMixin:
                             ):
                                 return
 
-                            model_for_metrics = str(body.get("model") or "unknown")
+                            model_for_metrics = completed_response_model
                             latency_ms = (
                                 (time.perf_counter() * 1000.0 - response_started_ms)
                                 if response_started_ms is not None
@@ -8074,6 +8304,13 @@ class OpenAIHandlerMixin:
                                     upstream_frame_index,
                                     ws_last_upstream_frame_type,
                                 )
+                                response = event.get("response")
+                                completed_response_model = (
+                                    str(response.get("model") or "unknown")
+                                    if isinstance(response, dict)
+                                    else "unknown"
+                                )
+
                                 if event_type == "response.created":
                                     response_started_ms = time.perf_counter() * 1000.0
                                 (
@@ -8090,6 +8327,11 @@ class OpenAIHandlerMixin:
                                     ws_cache_write_tokens_total += usage_cache_write_tokens
                                     ws_uncached_input_tokens_total += usage_uncached_tokens
 
+                                memory_enabled = bool(
+                                    self.memory_handler
+                                    and memory_user_id
+                                    and ws_memory_tools_allowed
+                                )
                                 if not memory_enabled:
                                     if event_type == "response.completed":
                                         response_completed_seen = True
@@ -8097,17 +8339,25 @@ class OpenAIHandlerMixin:
                                     await websocket.send_text(msg_str)
                                     continue
 
-                                # --- Phase 1: Buffer until first output item ---
-                                if not decided:
-                                    event_buffer.append(msg_str)
-
-                                    if event_type == "response.output_item.added":
-                                        item = event.get("item", {})
+                                if event_type == "response.output_item.done":
+                                    item = event.get("item", {})
+                                    if isinstance(item, dict):
+                                        response_output_items.append(item)
                                         if (
                                             item.get("type") == "function_call"
                                             and item.get("name") in MEMORY_TOOL_NAMES
                                         ):
-                                            # Memory tool first → suppress entire response
+                                            pending_fcs.append(item)
+
+                                if not decided:
+                                    event_buffer.append(msg_str)
+                                    if event_type == "response.output_item.added":
+                                        item = event.get("item", {})
+                                        if (
+                                            isinstance(item, dict)
+                                            and item.get("type") == "function_call"
+                                            and item.get("name") in MEMORY_TOOL_NAMES
+                                        ):
                                             suppress_response = True
                                             decided = True
                                             event_buffer.clear()
@@ -8115,106 +8365,108 @@ class OpenAIHandlerMixin:
                                                 f"[{request_id}] WS Memory: Detected "
                                                 f"{item.get('name')} — suppressing response"
                                             )
-                                        else:
-                                            # Non-memory first → flush buffer, pass through
+                                        elif not (
+                                            isinstance(item, dict)
+                                            and item.get("type") == "reasoning"
+                                        ):
                                             decided = True
                                             for buf in event_buffer:
                                                 await websocket.send_text(buf)
                                             event_buffer.clear()
-
+                                            continue
                                     elif event_type == "response.completed":
-                                        # No output items at all — flush
                                         decided = True
-                                for buf in event_buffer:
-                                    await websocket.send_text(buf)
-                                event_buffer.clear()
-                                await _record_ws_response_metrics()
-                                _reset()
-                                response_completed_seen = True
-
-                                continue
-
-                                # --- Phase 2a: Suppress mode (memory response) ---
-                                if suppress_response:
-                                    if event_type == "response.output_item.done":
-                                        item = event.get("item", {})
-                                        if (
-                                            item.get("type") == "function_call"
-                                            and item.get("name") in MEMORY_TOOL_NAMES
-                                        ):
-                                            pending_fcs.append(item)
-
-                                    elif event_type == "response.completed":
                                         response_completed_seen = True
                                         await _record_ws_response_metrics()
-                                        resp = event.get("response", {})
-                                        resp_id = resp.get("id")
-
-                                        if pending_fcs:
-                                            logger.info(
-                                                f"[{request_id}] WS Memory: Executing "
-                                                f"{len(pending_fcs)} tool(s) transparently"
-                                            )
-
-                                            # Execute memory tool calls
-                                            tool_outputs: list[dict[str, Any]] = []
-                                            for fc in pending_fcs:
-                                                call_id = fc.get("call_id", fc.get("id", ""))
-                                                fc_name = fc.get("name", "")
-                                                args_str = fc.get("arguments") or "{}"
-                                                try:
-                                                    fc_args = json.loads(args_str)
-                                                except (json.JSONDecodeError, TypeError):
-                                                    fc_args = {}
-
-                                                await self.memory_handler._ensure_initialized()
-                                                if self.memory_handler._backend:
-                                                    result = await self.memory_handler._execute_memory_tool(
-                                                        fc_name,
-                                                        fc_args,
-                                                        memory_user_id,
-                                                        "openai",
-                                                    )
-                                                else:
-                                                    result = json.dumps(
-                                                        {"error": "backend not ready"}
-                                                    )
-
-                                                tool_outputs.append(
-                                                    {
-                                                        "type": "function_call_output",
-                                                        "call_id": call_id,
-                                                        "output": result,
-                                                    }
-                                                )
-                                                logger.info(
-                                                    f"[{request_id}] WS Memory: Executed "
-                                                    f"{fc_name} for user {memory_user_id}"
-                                                )
-
-                                            # Send continuation upstream
-                                            cont: dict[str, Any] = {
-                                                "type": "response.create",
-                                                "response": {"input": tool_outputs},
-                                            }
-                                            if resp_id:
-                                                cont["response"]["previous_response_id"] = resp_id
-                                            await upstream.send(
-                                                _normalize_ws_response_create_for_upstream(
-                                                    json.dumps(cont)
-                                                )
-                                            )
-                                            logger.info(
-                                                f"[{request_id}] WS Memory: Sent continuation "
-                                                f"with {len(tool_outputs)} result(s)"
-                                            )
-
+                                        for buf in event_buffer:
+                                            await websocket.send_text(buf)
                                         _reset()
-                                    # All events suppressed in this mode
+                                        continue
+                                    if not decided:
+                                        continue
+
+                                if not suppress_response:
+                                    await websocket.send_text(msg_str)
+                                    if event_type == "response.completed":
+                                        response_completed_seen = True
+                                        await _record_ws_response_metrics()
+                                        _reset()
                                     continue
 
-                                # --- Phase 2b: Pass-through mode ---
-                                await websocket.send_text(msg_str)
+                                if event_type != "response.completed":
+                                    continue
+
+                                response_completed_seen = True
+                                await _record_ws_response_metrics()
+
+                                logger.info(
+                                    f"[{request_id}] WS Memory: Executing "
+                                    f"{len(pending_fcs)} tool(s) transparently"
+                                )
+
+                                # Execute memory tool calls.
+                                tool_outputs: list[dict[str, Any]] = []
+                                for fc in pending_fcs:
+                                    call_id = fc.get("call_id", fc.get("id", ""))
+                                    fc_name = fc.get("name", "")
+                                    args_str = fc.get("arguments") or "{}"
+                                    try:
+                                        fc_args = json.loads(args_str)
+                                    except (json.JSONDecodeError, TypeError):
+                                        fc_args = {}
+
+                                    await self.memory_handler._ensure_initialized()
+                                    if self.memory_handler._backend:
+                                        result = await self.memory_handler._execute_memory_tool(
+                                            fc_name,
+                                            fc_args,
+                                            memory_user_id,
+                                            "openai",
+                                        )
+                                    else:
+                                        result = json.dumps({"error": "backend not ready"})
+
+                                    tool_outputs.append(
+                                        {
+                                            "type": "function_call_output",
+                                            "call_id": call_id,
+                                            "output": result,
+                                        }
+                                    )
+                                    logger.info(
+                                        f"[{request_id}] WS Memory: Executed "
+                                        f"{fc_name} for user {memory_user_id}"
+                                    )
+
+                                stateless_input = _responses_stateless_input_items(
+                                    current_response_input
+                                )
+                                stateless_output = _responses_stateless_output_items(
+                                    response_output_items
+                                )
+                                current_response_input = [
+                                    *stateless_input,
+                                    *stateless_output,
+                                    *tool_outputs,
+                                ]
+                                continuation_response = {
+                                    **current_response_template,
+                                    "input": current_response_input,
+                                }
+                                continuation_response.pop("previous_response_id", None)
+                                cont: dict[str, Any] = {
+                                    "type": "response.create",
+                                    "response": continuation_response,
+                                }
+                                continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
+                                await upstream.send(
+                                    _normalize_ws_response_create_for_upstream(continuation_raw)
+                                )
+                                logger.info(
+                                    f"[{request_id}] WS Memory: Sent continuation "
+                                    f"with {len(tool_outputs)} result(s)"
+                                )
+                                _reset()
 
                         except asyncio.CancelledError:
                             raise
@@ -8411,9 +8663,23 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] WS upstream failed ({_ws_detail}), "
                     f"falling back to HTTP POST streaming"
                 )
-                await self._ws_http_fallback(
+                (
+                    fb_input_tokens,
+                    fb_output_tokens,
+                    fb_cache_read_tokens,
+                    fb_cache_write_tokens,
+                    fb_uncached_tokens,
+                ) = await self._ws_http_fallback(
                     websocket, body, first_msg_raw, upstream_headers, request_id
                 )
+                # Fold the fallback's provider usage into the session totals so
+                # the WS session-end outcome records the authoritative wire-token
+                # count instead of 0 (#2957).
+                ws_input_tokens_total += fb_input_tokens
+                ws_output_tokens_total += fb_output_tokens
+                ws_cache_read_tokens_total += fb_cache_read_tokens
+                ws_cache_write_tokens_total += fb_cache_write_tokens
+                ws_uncached_input_tokens_total += fb_uncached_tokens
 
             # ── WS session-end metric + RequestLog ──────────────────
             #
@@ -8431,11 +8697,7 @@ class OpenAIHandlerMixin:
             )
             if not isinstance(ws_inner_for_telemetry, dict):
                 ws_inner_for_telemetry = {}
-            model_name = (
-                ws_inner_for_telemetry.get("model")
-                or (body.get("model") if isinstance(body, dict) else None)
-                or "unknown"
-            )
+            model_name = str(current_response_template.get("model") or "unknown")
             _final_auth_mode = classify_auth_mode(ws_headers)
             residual_input_tokens = max(0, ws_input_tokens_total - ws_recorded_input_tokens_total)
             residual_output_tokens = max(
@@ -8665,14 +8927,31 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
-    ) -> None:
+    ) -> tuple[int, int, int, int, int]:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
         Converts the WS ``response.create`` message to an HTTP POST to
         ``/v1/responses?stream=true``, reads SSE events, and relays each
         ``data:`` line as a WS text message to the client.  This makes
         Codex work immediately instead of exhausting its WS retry budget.
+
+        Returns ``(input, output, cache_read, cache_write, uncached)`` provider
+        usage parsed from the ``response.completed`` SSE event. The caller folds
+        it into the session totals so the WS session-end outcome uses the
+        authoritative wire-token count; otherwise a fallback recorded
+        ``input_tokens=0`` and savings percentages blew past 100 (#2957).
         """
+        fallback_usage = [0, 0, 0, 0, 0]
+
+        def _accumulate_usage(data_str: str) -> None:
+            try:
+                event = json.loads(data_str)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if isinstance(event, dict) and event.get("type") == "response.completed":
+                for i, value in enumerate(_extract_responses_usage(event)):
+                    fallback_usage[i] += value
+
         # Route to correct endpoint based on auth mode
         is_chatgpt_fallback = has_chatgpt_account_header(upstream_headers)
         if is_chatgpt_fallback:
@@ -8778,7 +9057,7 @@ class OpenAIHandlerMixin:
                                 },
                             }
                             await websocket.send_text(json.dumps(error_event))
-                            return
+                            return tuple(fallback_usage)  # type: ignore[return-value]
 
                         # Refresh Codex /stats from the fallback response
                         # headers. We can't forward them onto the client 101
@@ -8804,10 +9083,11 @@ class OpenAIHandlerMixin:
                                     data = line[6:]
                                     if data == "[DONE]":
                                         continue
+                                    _accumulate_usage(data)
                                     try:
                                         await websocket.send_text(data)
                                     except Exception:
-                                        return
+                                        return tuple(fallback_usage)  # type: ignore[return-value]
                                 elif line.startswith("event: "):
                                     # SSE event type — skip, the data line contains the type
                                     continue
@@ -8816,9 +9096,10 @@ class OpenAIHandlerMixin:
                         for line in buffer.strip().splitlines():
                             line = line.strip()
                             if line.startswith("data: ") and line[6:] != "[DONE]":
+                                _accumulate_usage(line[6:])
                                 with contextlib.suppress(Exception):
                                     await websocket.send_text(line[6:])
-                        return
+                        return tuple(fallback_usage)  # type: ignore[return-value]
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as http_err:
                     if http_attempt >= retry_attempts - 1:
                         raise
@@ -8849,6 +9130,7 @@ class OpenAIHandlerMixin:
         finally:
             with contextlib.suppress(Exception):
                 await websocket.close()
+        return tuple(fallback_usage)  # type: ignore[return-value]
 
     def _derived_compress_pipeline(self, key: str, **overrides: Any) -> Any:
         """Cached ``/v1/compress`` pipeline derived from the live OpenAI router.
